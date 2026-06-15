@@ -1,0 +1,73 @@
+[package]
+name = "spot-defy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[lib]
+name = "spot_defy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spot-defy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "=1.0.102"
+apple-native-keyring-store = { version = "=1.0.0", features = ["keychain"] }
+async-trait = "=0.1.89"
+chrono = { version = "=0.4.45", default-features = false }
+clap = { version = "=4.6.1", features = ["derive"] }
+crossterm = { version = "=0.29.0", features = ["event-stream"] }
+dirs = "=6.0.0"
+futures = "=0.3.32"
+image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png"] }
+keyring-core = "=1.0.0"
+librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-oauth = { version = "=0.8.0", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["rodio-backend"] }
+ratatui = "=0.30.1"
+ratatui-image = { version = "=11.0.4", default-features = false, features = ["crossterm", "tokio"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+rspotify = { version = "=0.16.1", default-features = false, features = ["client-reqwest", "reqwest-rustls-tls"] }
+secrecy = "=0.10.3"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+thiserror = "=2.0.18"
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+toml = "=1.1.2"
+tracing = "=0.1.44"
+tracing-appender = "=0.2.5"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+unicode-width = "=0.2.2"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating
+allow_attributes = "deny"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy)
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

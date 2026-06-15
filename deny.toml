@@ -1,0 +1,74 @@
+# cargo-deny configuration for spot-defy.
+#
+# spot-defy is macOS-only, so analysis is scoped to the two macOS targets; this
+# drops platform-specific transitive crates (e.g. UEFI/Windows) that never ship.
+#
+# Every ignored advisory below is a TRANSITIVE dependency of librespot-core 0.8.0
+# (the embedded Spotify streaming engine) and is not fixable from this crate.
+# They originate from `hyper-proxy2 0.1.0` (HTTP-proxy support that librespot
+# pulls unconditionally) and `rsa` (Spotify access-point login). Re-evaluate on
+# every librespot bump and delete entries upstream has resolved.
+
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+  # rsa: Marvin timing side-channel in RSA decryption. No fixed release of the
+  # `rsa` crate exists. Reached only inside librespot's Spotify AP login
+  # handshake; exploitation needs a network-adjacent attacker and many samples.
+  "RUSTSEC-2023-0071",
+  # rustls-pemfile unmaintained (informational, not a vulnerability). Pulled via
+  # hyper-proxy2 -> rustls-native-certs. No swap available until librespot bumps.
+  "RUSTSEC-2025-0134",
+  # rustls-webpki 0.102.8 (CRL / name-constraint flaws + a CRL-parse panic).
+  # Lives ONLY in the hyper-proxy2 -> hyper-rustls 0.26 -> rustls 0.22 stack,
+  # which is exercised only when an HTTP proxy is configured. spot-defy never
+  # configures a proxy, so this path is unreachable; the app's own Spotify
+  # traffic uses the patched rustls-webpki 0.103.x.
+  "RUSTSEC-2026-0049",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
+]
+
+[licenses]
+# Permissive licenses only. priority-queue is "LGPL-3.0-or-later OR MPL-2.0";
+# allowing MPL-2.0 makes cargo-deny pick the non-copyleft side automatically.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "0BSD",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+# spot-defy itself carries no license field; do not flag the workspace member.
+private = { ignore = true }
+
+# webpki 0.22.4 (legacy, in the hyper-proxy2 TLS stack) ships an ISC-style
+# license in its LICENSE file but sets no SPDX `license` field.
+[[licenses.clarify]]
+crate = "webpki"
+expression = "ISC"
+license-files = []
+
+[bans]
+# librespot pulls duplicate major versions of the rustls/webpki stack (a modern
+# copy plus the legacy hyper-proxy2 copy). That is not a security issue, so the
+# duplicates are allowed rather than failing the supply-chain gate.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
