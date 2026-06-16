@@ -202,7 +202,7 @@ fn cells_for_pixels(pixels: u32, cell_pixels: u32, max_cells: u16) -> u16 {
 /// Draw the title/tab header with the active screen highlighted.
 fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
     let mut spans = vec![
-        Span::from(" SPOT-DEFY ").style(active_tab_style(model.theme)),
+        Span::from(" Spot[DEFY] ").style(active_tab_style(model.theme)),
         Span::from("  "),
     ];
     for (screen, label) in [
