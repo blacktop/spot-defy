@@ -39,7 +39,9 @@ jobs:
       - name: Verify release tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          version=$(cargo pkgid | sed 's/.*@//')
+          pkgid=$(cargo pkgid)
+          version=${pkgid##*#}
+          version=${version##*@}
           test "v${version}" = "${GITHUB_REF_NAME}"
 
       - name: Install cargo-deny
