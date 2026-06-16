@@ -59,6 +59,23 @@ To use your own Spotify Developer app for Web API quota, create an app at the
 ```toml
 client_id = "your-app-client-id"
 # redirect_port = 8899
+
+[keybindings]
+# Single-character normal-mode bindings.
+quit = "q"
+down = "j"
+up = "k"
+play_pause = " "
+next = "n"
+previous = "p"
+search = "/"
+
+[theme]
+# Supported names include standard ratatui colors plus spotify-green,
+# spotify-black, info-cyan, and info-cyan-dim.
+accent = "spotify-green"
+progress = "info-cyan"
+dim = "gray"
 ```
 
 ## Keybindings
@@ -148,14 +165,18 @@ Maintainer release flow:
 
 ```fish
 just check
-just tag 0.1.0
+just bump
 # wait for the GitHub Actions release to finish
-just tap-update 0.1.0
+just tap-update (just version)
 ```
 
-`just tag` pushes an annotated `vX.Y.Z` tag. GitHub Actions builds Apple Silicon
-and Intel macOS release tarballs, publishes them to the GitHub release, and
-uploads `checksums.txt`.
+`just bump` uses `svu patch` to pick the next version from Git tags, updates
+`Cargo.toml` and `Cargo.lock`, commits the release bump, pushes `main`, and
+pushes the matching annotated `vX.Y.Z` tag. Use `just bump-minor` or
+`just bump-major` for larger version increments.
+
+GitHub Actions builds Apple Silicon and Intel macOS release tarballs, publishes
+them to the GitHub release, and uploads `checksums.txt`.
 
 `just tap-update` downloads `checksums.txt`, generates
 `../homebrew-tap/Casks/spot-defy.rb`, and commits the tap change locally. Use

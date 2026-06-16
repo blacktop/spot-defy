@@ -8,6 +8,8 @@
 //! `crate::auth`.
 
 use anyhow::Context as _;
+use anyhow::bail;
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -23,6 +25,18 @@ const CONFIG_FILE: &str = "config.toml";
 /// logins never contend. A custom `client_id` must register
 /// `http://127.0.0.1:8899/login` (or whatever `redirect_port` is set to).
 const DEFAULT_REDIRECT_PORT: u16 = 8899;
+
+/// Spotify brand green (#1DB954), used as the default TUI accent.
+pub const SPOTIFY_GREEN: Color = Color::Rgb(0x1D, 0xB9, 0x54);
+
+/// Spotify's dark playing-view fallback, used as the TUI background.
+pub const SPOTIFY_BLACK: Color = Color::Rgb(0x19, 0x14, 0x14);
+
+/// Secondary cyan accent for progress and numeric/control information.
+pub const INFO_ACCENT: Color = Color::Rgb(0x5B, 0xD8, 0xE8);
+
+/// Dimmed secondary accent for fading transient controls.
+pub const INFO_ACCENT_DIM: Color = Color::Rgb(0x4F, 0x8F, 0x99);
 
 /// Top-level user configuration.
 ///
@@ -109,10 +123,46 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            accent: "green".to_owned(),
-            progress: "cyan".to_owned(),
+            accent: "spotify-green".to_owned(),
+            progress: "info-cyan".to_owned(),
             dim: "gray".to_owned(),
         }
+    }
+}
+
+/// Parsed runtime colors used by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeColors {
+    /// Accent color for highlighted/selected rows.
+    pub accent: Color,
+    /// Color of the now-playing progress bar.
+    pub progress: Color,
+    /// Color used for secondary/dim text and borders.
+    pub dim: Color,
+}
+
+impl Default for ThemeColors {
+    fn default() -> Self {
+        Self {
+            accent: SPOTIFY_GREEN,
+            progress: INFO_ACCENT,
+            dim: Color::Gray,
+        }
+    }
+}
+
+impl Theme {
+    /// Convert configured color names into ratatui colors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any configured color name is unknown.
+    pub fn colors(&self) -> anyhow::Result<ThemeColors> {
+        Ok(ThemeColors {
+            accent: parse_color("theme.accent", &self.accent)?,
+            progress: parse_color("theme.progress", &self.progress)?,
+            dim: parse_color("theme.dim", &self.dim)?,
+        })
     }
 }
 
@@ -162,6 +212,71 @@ impl Config {
     ///
     /// Returns an error if `contents` is not valid TOML for [`Config`].
     pub fn from_toml(contents: &str) -> anyhow::Result<Self> {
-        toml::from_str(contents).context("failed to parse config TOML")
+        let config: Self = toml::from_str(contents).context("failed to parse config TOML")?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate cross-field config constraints that serde alone cannot express.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate keybindings or unsupported theme color
+    /// names.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_keybindings(&self.keybindings)?;
+        self.theme.colors()?;
+        Ok(())
+    }
+}
+
+fn validate_keybindings(keybindings: &Keybindings) -> anyhow::Result<()> {
+    let bindings = [
+        ("quit", keybindings.quit),
+        ("down", keybindings.down),
+        ("up", keybindings.up),
+        ("play_pause", keybindings.play_pause),
+        ("next", keybindings.next),
+        ("previous", keybindings.previous),
+        ("search", keybindings.search),
+    ];
+
+    for (index, (name, key)) in bindings.iter().enumerate() {
+        if key.is_control() {
+            bail!("unsupported control-character keybinding for {name}");
+        }
+        if let Some((other_name, _)) = bindings[..index]
+            .iter()
+            .find(|(_, other_key)| other_key == key)
+        {
+            bail!("duplicate keybinding `{key}` for {other_name} and {name}");
+        }
+    }
+    Ok(())
+}
+
+fn parse_color(field: &str, value: &str) -> anyhow::Result<Color> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "spotify-green" => Ok(SPOTIFY_GREEN),
+        "spotify-black" => Ok(SPOTIFY_BLACK),
+        "info-cyan" => Ok(INFO_ACCENT),
+        "info-cyan-dim" => Ok(INFO_ACCENT_DIM),
+        "black" => Ok(Color::Black),
+        "red" => Ok(Color::Red),
+        "green" => Ok(Color::Green),
+        "yellow" => Ok(Color::Yellow),
+        "blue" => Ok(Color::Blue),
+        "magenta" => Ok(Color::Magenta),
+        "cyan" => Ok(Color::Cyan),
+        "gray" | "grey" => Ok(Color::Gray),
+        "darkgray" | "darkgrey" => Ok(Color::DarkGray),
+        "lightred" | "light-red" => Ok(Color::LightRed),
+        "lightgreen" | "light-green" => Ok(Color::LightGreen),
+        "lightyellow" | "light-yellow" => Ok(Color::LightYellow),
+        "lightblue" | "light-blue" => Ok(Color::LightBlue),
+        "lightmagenta" | "light-magenta" => Ok(Color::LightMagenta),
+        "lightcyan" | "light-cyan" => Ok(Color::LightCyan),
+        "white" => Ok(Color::White),
+        _ => bail!("unsupported {field} color `{value}`"),
     }
 }

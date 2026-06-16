@@ -67,8 +67,8 @@ pub trait SpotifyApi: Send + Sync {
     /// The user's top artists for a time window (`/me/top/artists`).
     async fn top_artists(&self, range: TimeRange) -> Result<Vec<ArtistItem>, ApiError>;
 
-    /// The user's recently played tracks.
-    async fn recently_played(&self, limit: u32) -> Result<Vec<TrackItem>, ApiError>;
+    /// The user's recently played tracks (capped at the endpoint's 50-item max).
+    async fn recently_played(&self) -> Result<Vec<TrackItem>, ApiError>;
 
     /// The user's saved (liked) tracks.
     async fn saved_tracks(&self) -> Result<Vec<TrackItem>, ApiError>;

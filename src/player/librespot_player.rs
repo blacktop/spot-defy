@@ -48,6 +48,16 @@ struct Connected {
     cursor: Option<usize>,
 }
 
+/// Resumable session state captured before a reconnect rebuilds the session.
+struct SessionSnapshot {
+    /// The play queue to restore.
+    queue: Vec<TrackId>,
+    /// The cursor (currently loaded track) to resume, if any.
+    cursor: Option<usize>,
+    /// The mixer volume (librespot raw scale) to carry over, if connected.
+    volume: Option<u16>,
+}
+
 /// librespot-backed playback engine.
 pub struct LibrespotPlayer {
     /// Sender the event bridge pushes normalized [`PlaybackEvent`]s onto.
@@ -85,6 +95,7 @@ impl LibrespotPlayer {
     async fn establish(
         &self,
         creds: Credentials,
+        restore_volume: Option<u16>,
     ) -> Result<(Session, Arc<Player>, Arc<dyn Mixer>), PlayerError> {
         let session = Session::new(SessionConfig::default(), None);
         // librespot's connect future is large; box it to satisfy `large_futures`.
@@ -93,6 +104,11 @@ impl LibrespotPlayer {
             .map_err(|e| PlayerError::Session(e.to_string()))?;
 
         let mixer = open_mixer()?;
+        // A fresh mixer starts at its default level; carry the prior volume over
+        // on reconnect so the user's chosen level survives a session rebuild.
+        if let Some(volume) = restore_volume {
+            mixer.set_volume(volume);
+        }
         let player = build_player(&session, &mixer)?;
         let bridge_rx = player.get_player_event_channel();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -103,24 +119,32 @@ impl LibrespotPlayer {
             Arc::clone(&self.generation),
         );
 
-        // Surface the initial mixer volume so the now-playing footer shows the
-        // real level from the start instead of a stale 0%.
+        // Surface the mixer volume so the now-playing footer shows the real level
+        // (the carried-over level on reconnect, the default on first connect).
         let _ = self.events_tx.send(PlaybackEvent::VolumeChanged {
             volume: mixer_to_percent(mixer.volume()),
         });
         Ok((session, player, mixer))
     }
 
-    /// Snapshot the current queue and cursor, releasing the lock before any
-    /// `.await` (clippy `await_holding_lock` is denied).
-    fn snapshot_queue(&self) -> Result<(Vec<TrackId>, Option<usize>), PlayerError> {
+    /// Snapshot the queue, cursor, and current volume, releasing the lock before
+    /// any `.await` (clippy `await_holding_lock` is denied).
+    fn snapshot_state(&self) -> Result<SessionSnapshot, PlayerError> {
         let guard = self
             .connected
             .lock()
             .map_err(|_| PlayerError::Session("reconnect: player lock poisoned".to_owned()))?;
         Ok(match guard.as_ref() {
-            Some(connected) => (connected.queue.clone(), connected.cursor),
-            None => (Vec::new(), None),
+            Some(connected) => SessionSnapshot {
+                queue: connected.queue.clone(),
+                cursor: connected.cursor,
+                volume: Some(connected.mixer.volume()),
+            },
+            None => SessionSnapshot {
+                queue: Vec::new(),
+                cursor: None,
+                volume: None,
+            },
         })
     }
 
@@ -166,7 +190,7 @@ impl Default for LibrespotPlayer {
 #[async_trait]
 impl Playback for LibrespotPlayer {
     async fn connect(&mut self, creds: Credentials) -> Result<(), PlayerError> {
-        let (session, player, mixer) = Box::pin(self.establish(creds)).await?;
+        let (session, player, mixer) = Box::pin(self.establish(creds, None)).await?;
         let mut guard = self
             .connected
             .lock()
@@ -182,19 +206,24 @@ impl Playback for LibrespotPlayer {
     }
 
     async fn reconnect(&self, creds: Credentials) -> Result<(), PlayerError> {
-        // Carry the queue/cursor across the rebuild so playback resumes where it
-        // left off. The lock is released before the handshake await.
-        let (queue, cursor) = self.snapshot_queue()?;
-        let (session, player, mixer) = Box::pin(self.establish(creds)).await?;
+        // Carry the queue/cursor/volume across the rebuild so playback resumes
+        // where it left off. The lock is released before the handshake await.
+        let snapshot = self.snapshot_state()?;
+        let (session, player, mixer) = Box::pin(self.establish(creds, snapshot.volume)).await?;
         let mut connected = Connected {
             _session: session,
             player,
             mixer,
-            queue,
+            queue: snapshot.queue,
             cursor: None,
         };
-        if let Some(index) = cursor {
-            Self::load_at(&mut connected, index, true)?;
+        // Install the new session first so it is the active generation, then
+        // resume best-effort: a failed reload must not orphan the new session
+        // (leaving the old, silenced one installed) or drop a live bridge.
+        if let Some(index) = snapshot.cursor {
+            if let Err(err) = Self::load_at(&mut connected, index, true) {
+                tracing::warn!(error = %err, "reconnect: could not resume current track");
+            }
         }
         let mut guard = self
             .connected
@@ -247,6 +276,25 @@ impl Playback for LibrespotPlayer {
                 Ok(())
             }
         })
+    }
+
+    fn preload_next(&self, current: &TrackId) -> Result<(), PlayerError> {
+        let mut guard = self
+            .connected
+            .lock()
+            .map_err(|_| PlayerError::Control("preload_next: player lock poisoned".to_owned()))?;
+        let Some(connected) = guard.as_mut() else {
+            return Ok(());
+        };
+        let uri = {
+            let Some(track) = next_track_to_preload(&connected.queue, connected.cursor, current)
+            else {
+                return Ok(());
+            };
+            track_uri(track)?
+        };
+        connected.player.preload(uri);
+        Ok(())
     }
 
     fn previous(&self) -> Result<(), PlayerError> {
@@ -344,7 +392,7 @@ fn spawn_event_bridge(
 
 /// Map a librespot `PlayerEvent` to the contract's [`PlaybackEvent`].
 ///
-/// Returns `None` for events the UI does not consume (preload, spirc hints,
+/// Returns `None` for events the UI does not consume (preload progress,
 /// session-metadata notices). Volume is converted from librespot's `0..=u16::MAX`
 /// scale to the contract's 0..=100 percentage.
 fn map_player_event(event: PlayerEvent) -> Option<PlaybackEvent> {
@@ -356,16 +404,6 @@ fn map_player_event(event: PlayerEvent) -> Option<PlaybackEvent> {
             track: uri_to_track_id(&track_id),
         }),
         PlayerEvent::Playing {
-            track_id,
-            position_ms,
-            ..
-        }
-        | PlayerEvent::PositionCorrection {
-            track_id,
-            position_ms,
-            ..
-        }
-        | PlayerEvent::Seeked {
             track_id,
             position_ms,
             ..
@@ -381,10 +419,17 @@ fn map_player_event(event: PlayerEvent) -> Option<PlaybackEvent> {
             track: uri_to_track_id(&track_id),
             position_ms,
         }),
-        PlayerEvent::PositionChanged { position_ms, .. } => {
+        // Seek and position corrections only move the playhead — they must not
+        // flip the transport state (a seek while paused stays paused).
+        PlayerEvent::PositionChanged { position_ms, .. }
+        | PlayerEvent::PositionCorrection { position_ms, .. }
+        | PlayerEvent::Seeked { position_ms, .. } => {
             Some(PlaybackEvent::PositionUpdate { position_ms })
         }
         PlayerEvent::EndOfTrack { track_id, .. } => Some(PlaybackEvent::EndOfTrack {
+            track: uri_to_track_id(&track_id),
+        }),
+        PlayerEvent::TimeToPreloadNextTrack { track_id, .. } => Some(PlaybackEvent::PreloadNext {
             track: uri_to_track_id(&track_id),
         }),
         PlayerEvent::Unavailable { track_id, .. } => Some(PlaybackEvent::Unavailable {
@@ -436,6 +481,21 @@ fn next_index(cursor: Option<usize>, len: usize) -> Option<usize> {
     (next < len).then_some(next)
 }
 
+/// Return the queue item to preload for a current-track hint.
+fn next_track_to_preload<'a>(
+    queue: &'a [TrackId],
+    cursor: Option<usize>,
+    current: &TrackId,
+) -> Option<&'a TrackId> {
+    let cursor = cursor?;
+    let loaded = queue.get(cursor)?;
+    if loaded != current {
+        return None;
+    }
+    let index = next_index(Some(cursor), queue.len())?;
+    queue.get(index)
+}
+
 /// Compute the index of the previous queue entry, or `None` at the start.
 fn previous_index(cursor: Option<usize>) -> Option<usize> {
     match cursor {
@@ -449,8 +509,8 @@ mod tests {
     use crate::model::TrackId;
     use crate::player::PlaybackEvent;
     use crate::player::librespot_player::{
-        map_player_event, mixer_to_percent, next_index, percent_to_mixer, previous_index,
-        track_uri, uri_to_track_id,
+        map_player_event, mixer_to_percent, next_index, next_track_to_preload, percent_to_mixer,
+        previous_index, track_uri, uri_to_track_id,
     };
     use librespot_core::spotify_id::SpotifyId;
     use librespot_core::spotify_uri::SpotifyUri;
@@ -500,6 +560,34 @@ mod tests {
     }
 
     #[test]
+    fn next_track_to_preload_requires_matching_cursor() {
+        let queue = vec![
+            TrackId("track-a".to_owned()),
+            TrackId("track-b".to_owned()),
+            TrackId("track-c".to_owned()),
+        ];
+
+        assert_eq!(
+            next_track_to_preload(&queue, Some(0), &TrackId("track-a".to_owned())),
+            Some(&TrackId("track-b".to_owned()))
+        );
+        assert_eq!(
+            next_track_to_preload(&queue, Some(0), &TrackId("track-c".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    fn next_track_to_preload_stops_at_queue_end() {
+        let queue = vec![TrackId("track-a".to_owned())];
+
+        assert_eq!(
+            next_track_to_preload(&queue, Some(0), &TrackId("track-a".to_owned())),
+            None
+        );
+    }
+
+    #[test]
     fn previous_index_walks_then_stops_at_start() {
         assert_eq!(previous_index(Some(2)), Some(1));
         assert_eq!(previous_index(Some(0)), None);
@@ -544,5 +632,19 @@ mod tests {
         let mapped = map_player_event(event);
 
         assert_eq!(mapped, Some(PlaybackEvent::Stopped { track: id }));
+    }
+
+    #[test]
+    fn preload_hint_maps_to_playback_preload_next() {
+        let id = TrackId("4uLU6hMCjMI75M1A2tKUQC".to_owned());
+        let track_id = track_uri(&id).expect("valid base62 id");
+        let event = PlayerEvent::TimeToPreloadNextTrack {
+            play_request_id: 1,
+            track_id,
+        };
+
+        let mapped = map_player_event(event);
+
+        assert_eq!(mapped, Some(PlaybackEvent::PreloadNext { track: id }));
     }
 }

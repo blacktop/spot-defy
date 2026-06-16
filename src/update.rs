@@ -62,10 +62,8 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Action> {
         Message::SeekRelative(delta) => seek_relative(model, delta),
         Message::VolumeDelta(delta) => volume_delta(model, delta),
         Message::NowPlayingRequested(reply) => now_playing_requested(model, reply),
-        // Events the reducer intentionally ignores: window resize is handled by
-        // the next draw, and the background token refresh updates the services
-        // directly rather than the Model.
-        Message::Resize(..) | Message::TokenRefreshed(_) => Vec::new(),
+        // Window resize is handled by the next draw, not the Model.
+        Message::Resize(..) => Vec::new(),
         Message::Error(text) => {
             model.set_error(text);
             Vec::new()
@@ -99,7 +97,11 @@ fn search_results(
     match result {
         Ok(results) => {
             model.search_results = results;
-            model.reset_selection();
+            // Only move the cursor if the user is still on this screen; a late
+            // response must not clobber the selection of a screen they left.
+            if model.screen == Screen::Search {
+                model.reset_selection();
+            }
         }
         Err(err) => model.set_error(format!("search failed: {err}")),
     }
@@ -114,7 +116,9 @@ fn top_artists_loaded(
     match result {
         Ok(artists) => {
             model.artists = artists;
-            model.reset_selection();
+            if model.screen == Screen::Library && model.library_tab == LibraryTab::TopArtists {
+                model.reset_selection();
+            }
         }
         Err(err) => model.set_error(format!("loading top artists failed: {err}")),
     }
@@ -129,7 +133,9 @@ fn albums_loaded(
     match result {
         Ok(albums) => {
             model.albums = albums;
-            model.reset_selection();
+            if model.screen == Screen::Library && model.library_tab == LibraryTab::Albums {
+                model.reset_selection();
+            }
         }
         Err(err) => model.set_error(format!("loading albums failed: {err}")),
     }
@@ -144,7 +150,9 @@ fn playlists_loaded(
     match result {
         Ok(playlists) => {
             model.playlists = playlists;
-            model.reset_selection();
+            if model.screen == Screen::Playlists {
+                model.reset_selection();
+            }
         }
         Err(err) => model.set_error(format!("loading playlists failed: {err}")),
     }
@@ -152,18 +160,21 @@ fn playlists_loaded(
 }
 
 /// Store a loaded track list (playlist tracks, top tracks, recent, or saved).
+///
+/// A load error is always surfaced, but loaded tracks only replace the list
+/// when the response still owns the active view — a stale response (the user
+/// navigated away) must not overwrite what they are now looking at.
 fn tracks_loaded(
     model: &mut Model,
     source: &TrackListSource,
     result: Result<Vec<crate::model::TrackItem>, crate::error::ApiError>,
 ) -> Vec<Action> {
-    if !accept_track_list_response(model, source) {
-        return Vec::new();
-    }
     match result {
         Ok(tracks) => {
-            model.tracks = tracks;
-            model.reset_selection();
+            if accept_track_list_response(model, source) {
+                model.tracks = tracks;
+                model.reset_selection();
+            }
         }
         Err(err) => model.set_error(format!("loading tracks failed: {err}")),
     }
@@ -288,12 +299,14 @@ fn tab_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
 
 /// Screen-switching, quit, and search-entry keys available everywhere.
 fn global_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
+    if char_key(code, model.keybindings.quit) {
+        return Some(quit(model));
+    }
+    if char_key(code, model.keybindings.search) {
+        model.screen = Screen::Search;
+        return Some(enter_insert(model));
+    }
     match code {
-        KeyCode::Char('q') => Some(quit(model)),
-        KeyCode::Char('/') => {
-            model.screen = Screen::Search;
-            Some(enter_insert(model))
-        }
         KeyCode::Char('1') => Some(enter_screen(model, Screen::Search)),
         KeyCode::Char('2') => Some(enter_screen(model, Screen::Playlists)),
         KeyCode::Char('3') => Some(enter_screen(model, Screen::Library)),
@@ -303,9 +316,13 @@ fn global_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
 
 /// List navigation and selection keys.
 fn navigation_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
+    if matches!(code, KeyCode::Down) || char_key(code, model.keybindings.down) {
+        return Some(select_next(model));
+    }
+    if matches!(code, KeyCode::Up) || char_key(code, model.keybindings.up) {
+        return Some(select_previous(model));
+    }
     match code {
-        KeyCode::Down | KeyCode::Char('j') => Some(select_next(model)),
-        KeyCode::Up | KeyCode::Char('k') => Some(select_previous(model)),
         KeyCode::Home | KeyCode::Char('g') => Some(select_first(model)),
         KeyCode::End | KeyCode::Char('G') => Some(select_last(model)),
         KeyCode::Enter => Some(activate_selection(model)),
@@ -316,16 +333,26 @@ fn navigation_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
 
 /// Playback transport keys (play/pause, skip, seek).
 fn transport_key(model: &mut Model, code: KeyCode) -> Vec<Action> {
+    if char_key(code, model.keybindings.play_pause) {
+        return toggle_play_pause(model);
+    }
+    if char_key(code, model.keybindings.next) {
+        return vec![Action::PlayerNext];
+    }
+    if char_key(code, model.keybindings.previous) {
+        return vec![Action::PlayerPrev];
+    }
     match code {
-        KeyCode::Char(' ') => toggle_play_pause(model),
-        KeyCode::Char('n') => vec![Action::PlayerNext],
-        KeyCode::Char('p') => vec![Action::PlayerPrev],
         KeyCode::Right | KeyCode::Char('l') => seek_relative(model, SEEK_STEP_MS),
         KeyCode::Left | KeyCode::Char('h') => seek_relative(model, -SEEK_STEP_MS),
         KeyCode::Char('+' | '=') => volume_delta(model, VOLUME_STEP),
         KeyCode::Char('-' | '_') => volume_delta(model, -VOLUME_STEP),
         _ => Vec::new(),
     }
+}
+
+fn char_key(code: KeyCode, binding: char) -> bool {
+    matches!(code, KeyCode::Char(key) if key == binding)
 }
 
 /// `Esc` in navigation mode steps back out of a drilled-in playlist.
@@ -609,6 +636,9 @@ fn playback_event(model: &mut Model, event: crate::player::PlaybackEvent) -> Vec
         Ev::PositionUpdate { position_ms } => model.now_playing.position_ms = position_ms,
         Ev::VolumeChanged { volume } => model.now_playing.volume = volume,
         Ev::Stopped { .. } => apply_stopped(model),
+        Ev::PreloadNext { track } => {
+            return vec![Action::PlayerPreloadNext { current: track }];
+        }
         Ev::EndOfTrack { .. } => return vec![Action::PlayerNext],
         Ev::Unavailable { .. } => return track_unavailable(model),
         Ev::SessionDisconnected => return session_disconnected(model),
@@ -635,8 +665,6 @@ fn apply_stopped(model: &mut Model) {
 /// fails), so reconnect once instead of skipping through the entire queue.
 fn track_unavailable(model: &mut Model) -> Vec<Action> {
     match model.playback_health {
-        // A reconnect is already in flight; keep skipping without re-triggering.
-        PlaybackHealth::Reconnecting => vec![Action::PlayerNext],
         PlaybackHealth::Healthy => {
             model.playback_health = PlaybackHealth::Skipping(1);
             model.set_error("track unavailable here — skipping".to_owned());
@@ -645,12 +673,27 @@ fn track_unavailable(model: &mut Model) -> Vec<Action> {
         PlaybackHealth::Skipping(count) => {
             let count = count + 1;
             if count >= RECONNECT_AFTER_FAILURES {
-                model.playback_health = PlaybackHealth::Reconnecting;
+                model.playback_health = PlaybackHealth::Reconnecting(0);
                 model.set_error("streaming connection lost — reconnecting".to_owned());
                 vec![Action::PlayerReconnect]
             } else {
                 model.playback_health = PlaybackHealth::Skipping(count);
                 model.set_error("track unavailable here — skipping".to_owned());
+                vec![Action::PlayerNext]
+            }
+        }
+        // After a reconnect, a few more failures means the tracks themselves are
+        // unplayable (not the session): skip a bounded number, then stop rather
+        // than skip-storming the rest of the queue.
+        PlaybackHealth::Reconnecting(count) => {
+            let count = count + 1;
+            if count >= RECONNECT_AFTER_FAILURES {
+                model.playback_health = PlaybackHealth::Healthy;
+                model.now_playing.state = PlaybackState::Stopped;
+                model.set_error("no playable tracks here — stopped".to_owned());
+                Vec::new()
+            } else {
+                model.playback_health = PlaybackHealth::Reconnecting(count);
                 vec![Action::PlayerNext]
             }
         }
@@ -660,11 +703,12 @@ fn track_unavailable(model: &mut Model) -> Vec<Action> {
 /// React to the streaming session dropping: reconnect once, marking stopped.
 fn session_disconnected(model: &mut Model) -> Vec<Action> {
     model.now_playing.state = PlaybackState::Stopped;
-    if model.playback_health == PlaybackHealth::Reconnecting {
+    if matches!(model.playback_health, PlaybackHealth::Reconnecting(_)) {
+        // A reconnect is already in flight; don't stack another.
         model.set_error("streaming session disconnected".to_owned());
         return Vec::new();
     }
-    model.playback_health = PlaybackHealth::Reconnecting;
+    model.playback_health = PlaybackHealth::Reconnecting(0);
     model.set_error("streaming session lost — reconnecting".to_owned());
     vec![Action::PlayerReconnect]
 }
@@ -728,6 +772,7 @@ mod tests {
     //! Key-routing and IPC-reply behavior. These live in-crate because they use
     //! `crossterm`/`tokio` types that an integration test crate cannot reach.
 
+    use crate::config::Keybindings;
     use crate::message::{Action, Message};
     use crate::model::PlaybackState;
     use crate::state::{Mode, Model, Screen};
@@ -818,6 +863,43 @@ mod tests {
         model.now_playing.state = PlaybackState::Playing;
         let actions = update(&mut model, key(KeyCode::Char(' ')));
         assert_eq!(actions, vec![Action::PlayerPause]);
+    }
+
+    #[test]
+    fn configured_keys_override_default_character_bindings() {
+        let mut model = Model::new();
+        model.keybindings = Keybindings {
+            quit: 'x',
+            down: 's',
+            up: 'w',
+            play_pause: 'b',
+            next: 'l',
+            previous: 'h',
+            search: 'f',
+        };
+
+        update(&mut model, key(KeyCode::Char('q')));
+        assert!(!model.should_quit);
+        update(&mut model, key(KeyCode::Char('x')));
+        assert!(model.should_quit);
+
+        model.should_quit = false;
+        model.now_playing.state = PlaybackState::Playing;
+        assert_eq!(
+            update(&mut model, key(KeyCode::Char('b'))),
+            vec![Action::PlayerPause]
+        );
+        assert_eq!(
+            update(&mut model, key(KeyCode::Char('l'))),
+            vec![Action::PlayerNext]
+        );
+        assert_eq!(
+            update(&mut model, key(KeyCode::Char('h'))),
+            vec![Action::PlayerPrev]
+        );
+        update(&mut model, key(KeyCode::Char('f')));
+        assert_eq!(model.screen, Screen::Search);
+        assert_eq!(model.mode, Mode::Insert);
     }
 
     #[test]

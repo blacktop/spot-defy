@@ -10,7 +10,7 @@ use crate::auth::{self, TokenSet};
 use crate::config::Config;
 use crate::message::{Action, Message};
 use crate::model::{AlbumArtImage, PlaybackSnapshot, TrackListSource};
-use crate::player::Playback;
+use crate::player::{Playback, PlaybackEvent};
 use crate::state::Model;
 use anyhow::Context as _;
 use crossterm::event::{Event, EventStream};
@@ -132,7 +132,7 @@ async fn build_app(
     Box::pin(player.connect(auth::to_librespot_credentials(streaming)))
         .await
         .context("failed to connect streaming session")?;
-    let mut app = App::new(Box::new(api), Box::new(player), streaming.clone());
+    let mut app = App::new(Box::new(api), Box::new(player), streaming.clone(), config)?;
     app.schedule_token_refresh(
         webapi.expires_at,
         config.client_id.clone(),
@@ -143,17 +143,22 @@ async fn build_app(
 
 impl App {
     /// Assemble the application from its service dependencies.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if keybindings conflict or configured theme color names
+    /// cannot be converted into renderer colors.
     pub fn new(
         api: Box<dyn SpotifyApi>,
         player: Box<dyn Playback>,
         streaming_token: TokenSet,
-    ) -> Self {
+        config: &Config,
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = unbounded_channel();
         let (now_playing_tx, _now_playing_rx) = watch::channel(PlaybackSnapshot::default());
         let (art_tx, art_rx) = unbounded_channel();
-        Self {
-            model: Model::new(),
+        Ok(Self {
+            model: Model::from_config(config)?,
             api: Arc::from(api),
             player: Arc::from(player),
             tx,
@@ -168,7 +173,7 @@ impl App {
             art_rx,
             art_url: None,
             streaming_token,
-        }
+        })
     }
 
     /// Install the terminal image-protocol picker. Must be queried *before*
@@ -357,8 +362,14 @@ impl App {
         let creds = auth::to_librespot_credentials(&self.streaming_token);
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            if let Some(message) = reconnect_session(player, creds).await {
-                let _ = tx.send(message);
+            if let Some(err) = reconnect_session(player, creds).await {
+                // Reset the reducer's reconnect state (via Stopped) so a
+                // permanently failed reconnect does not wedge playback in
+                // Reconnecting, then surface the failure.
+                let _ = tx.send(Message::PlaybackEvent(PlaybackEvent::Stopped {
+                    track: crate::model::TrackId(String::new()),
+                }));
+                let _ = tx.send(Message::Error(err));
             }
         });
     }
@@ -538,7 +549,7 @@ async fn run_action(
             Some(Message::TopArtistsLoaded(api.top_artists(range).await))
         }
         Action::LoadRecentlyPlayed => {
-            let result = api.recently_played(crate::api::SEARCH_LIMIT_MAX).await;
+            let result = api.recently_played().await;
             Some(Message::TrackListLoaded {
                 source: TrackListSource::RecentlyPlayed,
                 result,
@@ -565,15 +576,13 @@ async fn run_action(
         Action::PlayerPlay => player_result(player.play()),
         Action::PlayerPause => player_result(player.pause()),
         Action::PlayerNext => player_result(player.next()),
+        Action::PlayerPreloadNext { current } => player_result(player.preload_next(&current)),
         Action::PlayerPrev => player_result(player.previous()),
         Action::PlayerSeek(position_ms) => player_result(player.seek(position_ms)),
         Action::PlayerSetVolume(volume) => player_result(player.set_volume(volume)),
         // Handled inline in `dispatch_action` (IPC publish, art loading, and the
         // session reconnect); the background token refresh runs as its own task.
-        Action::RefreshToken
-        | Action::PublishNowPlaying(_)
-        | Action::LoadAlbumArt(_)
-        | Action::PlayerReconnect => None,
+        Action::PublishNowPlaying(_) | Action::LoadAlbumArt(_) | Action::PlayerReconnect => None,
     }
 }
 
@@ -606,17 +615,19 @@ async fn search(
 ///
 /// Returns `None` on success (the resumed track's events update the UI) and an
 /// error message only on hard failure.
-async fn reconnect_session(player: Arc<dyn Playback>, creds: Credentials) -> Option<Message> {
+async fn reconnect_session(player: Arc<dyn Playback>, creds: Credentials) -> Option<String> {
     if player.reconnect(creds).await.is_ok() {
         return None;
     }
     match auth::obtain_streaming_token().await {
-        Ok(fresh) => player_result(
-            player
-                .reconnect(auth::to_librespot_credentials(&fresh))
-                .await,
-        ),
-        Err(err) => Some(Message::Error(format!("streaming reconnect failed: {err}"))),
+        Ok(fresh) => match player
+            .reconnect(auth::to_librespot_credentials(&fresh))
+            .await
+        {
+            Ok(()) => None,
+            Err(err) => Some(format!("streaming reconnect failed: {err}")),
+        },
+        Err(err) => Some(format!("streaming reconnect failed: {err}")),
     }
 }
 

@@ -1,13 +1,14 @@
 //! The TEA `Model`: all UI state, including widget state carried across frames.
 //!
-//! `ListState`/`TableState` live here (constructed once), never rebuilt in
-//! `crate::view`. Screens and input modes are enums, not boolean flags.
+//! `ListState` lives here (constructed once), never rebuilt in `crate::view`.
+//! Screens and input modes are enums, not boolean flags.
 
 use crate::api::SearchResultset;
+use crate::config::{Config, Keybindings, ThemeColors};
 use crate::model::{
     AlbumItem, ArtistItem, PlaybackSnapshot, PlaylistItem, TrackId, TrackItem, TrackListSource,
 };
-use ratatui::widgets::{ListState, TableState};
+use ratatui::widgets::ListState;
 use std::time::Instant;
 
 /// Top-level screen the user is currently viewing.
@@ -46,9 +47,9 @@ pub enum PlaybackHealth {
     /// `n` consecutive tracks were unavailable, still below the reconnect
     /// threshold, so keep skipping.
     Skipping(u32),
-    /// A reconnect has been requested; further failures are skipped without
-    /// re-triggering until a track plays successfully.
-    Reconnecting,
+    /// A reconnect has been requested; `n` counts failures skipped since, bounded
+    /// so a fully-unplayable queue stops rather than skip-storming to the end.
+    Reconnecting(u32),
 }
 
 /// Sub-views of the Library/discovery screen, cycled with Tab/Shift-Tab.
@@ -176,6 +177,10 @@ impl Default for SearchState {
 /// The complete UI model.
 #[derive(Default)]
 pub struct Model {
+    /// User-configured normal-mode keybindings.
+    pub keybindings: Keybindings,
+    /// User-configured renderer colors.
+    pub theme: ThemeColors,
     /// Active screen.
     pub screen: Screen,
     /// Active input mode.
@@ -188,8 +193,6 @@ pub struct Model {
     pub library_tab: LibraryTab,
     /// Selection state for the active list.
     pub list_state: ListState,
-    /// Selection state for the active table.
-    pub table_state: TableState,
     /// Loaded playlists (Playlists screen).
     pub playlists: Vec<PlaylistItem>,
     /// Loaded tracks (playlist tracks or the track-based Library tabs).
@@ -222,6 +225,21 @@ impl Model {
         Self::default()
     }
 
+    /// Create a fresh model using the loaded user config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if keybindings conflict or configured theme color names
+    /// are invalid.
+    pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            keybindings: config.keybindings.clone(),
+            theme: config.theme.colors()?,
+            ..Self::default()
+        })
+    }
+
     /// Record a transient status/error message for the footer.
     pub fn set_error(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
@@ -232,14 +250,13 @@ impl Model {
         self.status = None;
     }
 
-    /// Reset both selection cursors when the active list contents change.
+    /// Reset the selection cursor when the active list contents change.
     ///
     /// Selects the first row when the visible list is non-empty, otherwise
     /// clears the selection so the highlight does not point past the end.
     pub fn reset_selection(&mut self) {
         let selected = (self.active_len() > 0).then_some(0);
         self.list_state.select(selected);
-        self.table_state.select(selected);
     }
 
     /// Number of rows in the list currently visible for the active screen/tab.

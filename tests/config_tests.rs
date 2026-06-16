@@ -2,7 +2,8 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use spot_defy::config::{Config, config_path};
+use ratatui::style::Color;
+use spot_defy::config::{Config, ThemeColors, config_path};
 
 #[test]
 fn default_config_uses_webapi_client_id_and_port() {
@@ -21,6 +22,15 @@ fn default_keybindings_match_vim_conventions() {
     assert_eq!(config.keybindings.down, 'j');
     assert_eq!(config.keybindings.up, 'k');
     assert_eq!(config.keybindings.search, '/');
+}
+
+#[test]
+fn default_theme_uses_spotify_colors() {
+    let config = Config::default();
+    assert_eq!(
+        config.theme.colors().expect("default theme"),
+        ThemeColors::default()
+    );
 }
 
 #[test]
@@ -68,6 +78,10 @@ dim = "darkgray"
     assert_eq!(config.keybindings.next, 'l');
     assert_eq!(config.theme.accent, "magenta");
     assert_eq!(config.theme.dim, "darkgray");
+    let colors = config.theme.colors().expect("custom colors should parse");
+    assert_eq!(colors.accent, Color::Magenta);
+    assert_eq!(colors.progress, Color::Yellow);
+    assert_eq!(colors.dim, Color::DarkGray);
 }
 
 #[test]
@@ -98,6 +112,33 @@ fn multi_char_keybinding_is_rejected() {
     let toml = "[keybindings]\nquit = \"esc\"";
     let result = Config::from_toml(toml);
     assert!(result.is_err(), "a char binding must be a single character");
+}
+
+#[test]
+fn duplicate_keybindings_are_rejected() {
+    let toml = "[keybindings]\nquit = \"x\"\nsearch = \"x\"";
+    let result = Config::from_toml(toml);
+    assert!(
+        result.is_err(),
+        "duplicate configurable bindings must error"
+    );
+}
+
+#[test]
+fn control_character_keybindings_are_rejected() {
+    let toml = "[keybindings]\nquit = \"\\t\"";
+    let result = Config::from_toml(toml);
+    assert!(
+        result.is_err(),
+        "control-character bindings cannot be matched as normal Char keys"
+    );
+}
+
+#[test]
+fn unknown_theme_color_is_rejected() {
+    let toml = "[theme]\naccent = \"chartreuse-ish\"";
+    let result = Config::from_toml(toml);
+    assert!(result.is_err(), "unknown theme colors must error");
 }
 
 #[test]

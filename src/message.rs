@@ -6,7 +6,7 @@
 //! further [`Message`]s back. `update` itself performs no I/O.
 
 use crate::api::SearchResultset;
-use crate::error::{ApiError, AuthError};
+use crate::error::ApiError;
 use crate::ipc::NowPlayingPayload;
 use crate::model::{
     AlbumArtImage, AlbumId, AlbumItem, ArtistItem, PlaybackSnapshot, PlaylistId, PlaylistItem,
@@ -75,8 +75,6 @@ pub enum Message {
     SeekRelative(i32),
     /// Change the app (librespot) volume by a relative percentage.
     VolumeDelta(i16),
-    /// The background token refresh completed.
-    TokenRefreshed(Result<(), AuthError>),
     /// An IPC client asked for the current now-playing line.
     NowPlayingRequested(oneshot::Sender<NowPlayingPayload>),
     /// A non-fatal error to surface in the UI.
@@ -112,6 +110,8 @@ pub enum Action {
     PlayerPause,
     /// Advance to the next queued track.
     PlayerNext,
+    /// Preload the next queued track while `current` is still playing.
+    PlayerPreloadNext { current: TrackId },
     /// Go back to the previous queued track.
     PlayerPrev,
     /// Rebuild the dropped streaming session and resume the current track.
@@ -120,8 +120,6 @@ pub enum Action {
     PlayerSeek(u32),
     /// Set absolute app (librespot) volume (0..=100).
     PlayerSetVolume(u16),
-    /// Refresh the OAuth access token.
-    RefreshToken,
     /// Download + decode the best now-playing album-art candidate for the pane.
     LoadAlbumArt(Vec<AlbumArtImage>),
     /// Publish a now-playing snapshot to the IPC layer.

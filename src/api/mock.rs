@@ -60,7 +60,7 @@ impl SpotifyApi for MockApi {
         Ok(self.artists.clone())
     }
 
-    async fn recently_played(&self, _limit: u32) -> Result<Vec<TrackItem>, ApiError> {
+    async fn recently_played(&self) -> Result<Vec<TrackItem>, ApiError> {
         Ok(self.tracks.clone())
     }
 

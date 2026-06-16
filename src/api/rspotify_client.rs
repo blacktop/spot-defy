@@ -237,9 +237,13 @@ impl SpotifyApi for RspotifyApi {
                         .current_user_playlists_manual(Some(PAGE_LIMIT), Some(offset))
                 })
                 .await?;
-            let count = page.items.len();
+            // Terminate on the page's own `next` marker (or an empty page), not a
+            // short page: Spotify can return fewer than the requested items on a
+            // non-final page. We read `next` only as a "more pages" flag and still
+            // paginate by manual offset (the `next` URL itself 403s).
+            let is_last = page.next.is_none() || page.items.is_empty();
             playlists.extend(page.items.iter().map(map_simplified_playlist));
-            if count < PAGE_LIMIT as usize {
+            if is_last {
                 break;
             }
         }
@@ -289,10 +293,12 @@ impl SpotifyApi for RspotifyApi {
         Ok(page.items.iter().map(map_full_artist).collect())
     }
 
-    async fn recently_played(&self, limit: u32) -> Result<Vec<TrackItem>, ApiError> {
-        let limit = limit.min(RECENTLY_PLAYED_MAX);
+    async fn recently_played(&self) -> Result<Vec<TrackItem>, ApiError> {
         let page = self
-            .retrying(|| self.client.current_user_recently_played(Some(limit), None))
+            .retrying(|| {
+                self.client
+                    .current_user_recently_played(Some(RECENTLY_PLAYED_MAX), None)
+            })
             .await?;
         Ok(page
             .items
@@ -328,9 +334,9 @@ impl SpotifyApi for RspotifyApi {
                     )
                 })
                 .await?;
-            let count = page.items.len();
+            let is_last = page.next.is_none() || page.items.is_empty();
             albums.extend(page.items.iter().map(|saved| map_full_album(&saved.album)));
-            if count < PAGE_LIMIT as usize {
+            if is_last {
                 break;
             }
         }

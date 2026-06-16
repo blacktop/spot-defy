@@ -27,6 +27,9 @@ pub enum PlaybackEvent {
     Paused { track: TrackId, position_ms: u32 },
     /// The current track finished.
     EndOfTrack { track: TrackId },
+    /// The current track is close enough to ending that the next queue item
+    /// should be preloaded.
+    PreloadNext { track: TrackId },
     /// Playback stopped without loading another track.
     Stopped { track: TrackId },
     /// A periodic position update while playing.
@@ -104,6 +107,17 @@ pub trait Playback: Send + Sync {
     ///
     /// Returns [`PlayerError`] if the queue is empty or the load fails.
     fn next(&self) -> Result<(), PlayerError>;
+
+    /// Preload the next app-side queue item after `current`, if one exists.
+    ///
+    /// This is a best-effort latency hint from the streaming engine. A stale
+    /// hint, missing cursor, or end-of-queue condition is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError`] if the player state lock is poisoned or the next
+    /// track id cannot be converted into a playable URI.
+    fn preload_next(&self, current: &TrackId) -> Result<(), PlayerError>;
 
     /// Rewind the app-side queue cursor and load the previous track.
     ///

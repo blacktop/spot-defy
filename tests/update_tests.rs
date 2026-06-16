@@ -316,6 +316,19 @@ fn end_of_track_advances_queue() {
 }
 
 #[test]
+fn preload_hint_prefetches_next_queue_item() {
+    let mut model = Model::new();
+    let current = TrackId("t1".to_owned());
+    let event = PlaybackEvent::PreloadNext {
+        track: current.clone(),
+    };
+
+    let actions = update(&mut model, Message::PlaybackEvent(event));
+
+    assert_eq!(actions, vec![Action::PlayerPreloadNext { current }]);
+}
+
+#[test]
 fn unavailable_event_skips_to_next_with_status() {
     let mut model = Model::new();
     let event = PlaybackEvent::Unavailable {
@@ -383,6 +396,73 @@ fn session_disconnect_requests_reconnect_once() {
     );
     // A second disconnect while already reconnecting does not pile on.
     assert_eq!(update(&mut model, disconnect()), Vec::new());
+}
+
+#[test]
+fn unavailable_after_reconnect_is_bounded_then_stops() {
+    let mut model = Model::new();
+    let unavailable = || {
+        Message::PlaybackEvent(PlaybackEvent::Unavailable {
+            track: TrackId("t".to_owned()),
+        })
+    };
+    // Drive into the post-reconnect state.
+    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    assert_eq!(
+        update(&mut model, unavailable()),
+        vec![Action::PlayerReconnect]
+    );
+    // Post-reconnect failures skip a bounded number, then STOP rather than
+    // skip-storming the rest of the queue track-by-track.
+    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    let stopped = update(&mut model, unavailable());
+    assert!(stopped.is_empty(), "the storm must stop, not keep skipping");
+    assert_eq!(model.now_playing.state, PlaybackState::Stopped);
+}
+
+#[test]
+fn stopped_event_unwedges_a_failed_reconnect() {
+    let mut model = Model::new();
+    let disconnect = || Message::PlaybackEvent(PlaybackEvent::SessionDisconnected);
+    assert_eq!(
+        update(&mut model, disconnect()),
+        vec![Action::PlayerReconnect]
+    );
+    // A permanently failed reconnect emits Stopped, which clears the streak so
+    // the state machine is not wedged in Reconnecting forever.
+    update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::Stopped {
+            track: TrackId(String::new()),
+        }),
+    );
+    // A later disconnect now retries instead of being silently swallowed.
+    assert_eq!(
+        update(&mut model, disconnect()),
+        vec![Action::PlayerReconnect]
+    );
+}
+
+#[test]
+fn late_search_result_does_not_reset_another_screens_selection() {
+    let mut model = Model::new();
+    model.screen = Screen::Playlists;
+    model.playlists = vec![
+        playlist("p1", "a"),
+        playlist("p2", "b"),
+        playlist("p3", "c"),
+    ];
+    model.list_state.select(Some(2));
+    // A search dispatched earlier completes after the user moved to Playlists.
+    update(
+        &mut model,
+        Message::SearchResults(Ok(SearchResultset::default())),
+    );
+    assert_eq!(
+        model.list_state.selected(),
+        Some(2),
+        "a stale search response must not snap another screen's cursor to the top"
+    );
 }
 
 #[test]

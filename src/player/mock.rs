@@ -88,6 +88,10 @@ impl Playback for MockPlayer {
         Ok(())
     }
 
+    fn preload_next(&self, _current: &TrackId) -> Result<(), PlayerError> {
+        Ok(())
+    }
+
     fn previous(&self) -> Result<(), PlayerError> {
         Ok(())
     }

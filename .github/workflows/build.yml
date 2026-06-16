@@ -22,6 +22,16 @@ jobs:
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
+      - name: Verify release tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          expected="v${version}"
+          if [[ "${expected}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "::error title=Release tag/version mismatch::Cargo.toml version is ${version}, but the pushed tag is ${GITHUB_REF_NAME}. Bump Cargo.toml/Cargo.lock or push ${expected} instead."
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
@@ -35,14 +45,6 @@ jobs:
 
       - name: Test
         run: cargo test --all-features --locked
-
-      - name: Verify release tag matches Cargo.toml
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          pkgid=$(cargo pkgid)
-          version=${pkgid##*#}
-          version=${version##*@}
-          test "v${version}" = "${GITHUB_REF_NAME}"
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.19.6 --locked

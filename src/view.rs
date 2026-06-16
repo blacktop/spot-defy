@@ -7,11 +7,12 @@
 //! here. Spotify green is the primary accent; the now-playing progress bar is
 //! drawn by hand so text over the fill flips to a dark, readable color.
 
+use crate::config::{SPOTIFY_BLACK, ThemeColors};
 use crate::model::{AlbumItem, ArtistItem, PlaybackState, PlaylistItem, TrackItem};
 use crate::state::{LibraryTab, Mode, Model, Screen, SearchTab};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Style, Stylize as _};
+use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Clear, Gauge, HighlightSpacing, List, ListItem, Paragraph,
@@ -20,19 +21,6 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{FontSize, Resize, StatefulImage};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
-/// Spotify brand green (#1DB954) — the primary accent. Defined as true-color RGB
-/// so it renders the same regardless of the terminal's ANSI palette.
-const SPOTIFY_GREEN: Color = Color::Rgb(0x1D, 0xB9, 0x54);
-
-/// Spotify's recommended dark fallback for playing views when artwork color is
-/// unavailable.
-const SPOTIFY_BLACK: Color = Color::Rgb(0x19, 0x14, 0x14);
-
-/// One extra accent for live numeric/control information. Keeping it narrow
-/// preserves the green/white identity without making every datum compete.
-const INFO_ACCENT: Color = Color::Rgb(0x5B, 0xD8, 0xE8);
-const INFO_ACCENT_DIM: Color = Color::Rgb(0x4F, 0x8F, 0x99);
 
 /// Minimum body width before the right-third artwork column appears.
 const ARTWORK_MIN_TOTAL: u16 = 96;
@@ -46,26 +34,27 @@ const VOLUME_POPUP_WIDTH: u16 = 34;
 const VOLUME_POPUP_HEIGHT: u16 = 5;
 const VOLUME_FADE_WINDOW: Duration = Duration::from_millis(400);
 
-/// Dim color for borders, so the green content stands out.
-const BORDER: Color = Color::Rgb(0x45, 0x45, 0x45);
-
 /// The selection highlight: solid green bar with black text.
-fn highlight_style() -> Style {
-    Style::new().fg(SPOTIFY_BLACK).bg(SPOTIFY_GREEN).bold()
+fn highlight_style(theme: ThemeColors) -> Style {
+    Style::new().fg(SPOTIFY_BLACK).bg(theme.accent).bold()
 }
 
 /// The active-tab "pill" style: black on green.
-fn active_tab_style() -> Style {
-    Style::new().fg(SPOTIFY_BLACK).bg(SPOTIFY_GREEN).bold()
+fn active_tab_style(theme: ThemeColors) -> Style {
+    Style::new().fg(SPOTIFY_BLACK).bg(theme.accent).bold()
+}
+
+fn dim_style(theme: ThemeColors) -> Style {
+    Style::new().fg(theme.dim)
 }
 
 /// A bordered block with rounded corners, a dim border, and a green title.
-fn panel(title: &str) -> Block<'static> {
+fn panel(theme: ThemeColors, title: &str) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
         .style(Style::new().bg(SPOTIFY_BLACK))
-        .border_style(Style::new().fg(BORDER))
-        .title(title.to_owned().fg(SPOTIFY_GREEN).bold())
+        .border_style(dim_style(theme))
+        .title(title.to_owned().fg(theme.accent).bold())
 }
 
 /// Render the entire UI for the current frame.
@@ -149,7 +138,7 @@ fn render_sidebar(
     area: Rect,
 ) {
     let title = model.now_playing.track.as_deref().unwrap_or("Now Playing");
-    let block = panel(title);
+    let block = panel(model.theme, title);
     let inner = block.inner(area).inner(Margin {
         horizontal: 1,
         vertical: 1,
@@ -172,7 +161,10 @@ fn render_sidebar(
         } else {
             "no track playing"
         };
-        frame.render_widget(Paragraph::new(placeholder.dim()).centered(), image_area);
+        frame.render_widget(
+            Paragraph::new(Span::from(placeholder).style(dim_style(model.theme))).centered(),
+            image_area,
+        );
     }
 }
 
@@ -210,7 +202,7 @@ fn cells_for_pixels(pixels: u32, cell_pixels: u32, max_cells: u16) -> u16 {
 /// Draw the title/tab header with the active screen highlighted.
 fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
     let mut spans = vec![
-        Span::from(" SPOT-DEFY ").style(active_tab_style()),
+        Span::from(" SPOT-DEFY ").style(active_tab_style(model.theme)),
         Span::from("  "),
     ];
     for (screen, label) in [
@@ -220,16 +212,16 @@ fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
     ] {
         let span = Span::from(format!(" {label} "));
         spans.push(if screen == active_tab(model.screen) {
-            span.style(active_tab_style())
+            span.style(active_tab_style(model.theme))
         } else {
-            span.dim()
+            span.style(dim_style(model.theme))
         });
         spans.push(Span::from(" "));
     }
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .style(Style::new().bg(SPOTIFY_BLACK))
-        .border_style(Style::new().fg(SPOTIFY_GREEN));
+        .border_style(Style::new().fg(model.theme.accent));
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
@@ -251,12 +243,15 @@ fn render_search(model: &mut Model, frame: &mut Frame, area: Rect) {
     .areas(area);
 
     let title = if model.mode == Mode::Insert {
-        "Search (typing)"
+        "Search (typing)".to_owned()
     } else {
-        "Search (press / to edit)"
+        format!(
+            "Search (press {} to edit)",
+            key_label(model.keybindings.search)
+        )
     };
     frame.render_widget(
-        Paragraph::new(model.search.query.as_str()).block(panel(title)),
+        Paragraph::new(model.search.query.as_str()).block(panel(model.theme, &title)),
         input,
     );
 
@@ -273,6 +268,7 @@ fn render_search(model: &mut Model, frame: &mut Frame, area: Rect) {
         tabs,
         &labels,
         active_index(&SearchTab::ALL, model.search_tab),
+        model.theme,
     );
     render_search_lane(model, frame, results);
 }
@@ -282,11 +278,21 @@ fn render_search_lane(model: &mut Model, frame: &mut Frame, area: Rect) {
     let (title, items): (&str, Vec<ListItem<'static>>) = match model.search_tab {
         SearchTab::Tracks => (
             "Tracks",
-            model.search_results.tracks.iter().map(track_row).collect(),
+            model
+                .search_results
+                .tracks
+                .iter()
+                .map(|track| track_row(track, model.theme))
+                .collect(),
         ),
         SearchTab::Albums => (
             "Albums",
-            model.search_results.albums.iter().map(album_row).collect(),
+            model
+                .search_results
+                .albums
+                .iter()
+                .map(|album| album_row(album, model.theme))
+                .collect(),
         ),
         SearchTab::Artists => (
             "Artists",
@@ -294,7 +300,7 @@ fn render_search_lane(model: &mut Model, frame: &mut Frame, area: Rect) {
                 .search_results
                 .artists
                 .iter()
-                .map(artist_row)
+                .map(|artist| artist_row(artist, model.theme))
                 .collect(),
         ),
         SearchTab::Playlists => (
@@ -303,7 +309,7 @@ fn render_search_lane(model: &mut Model, frame: &mut Frame, area: Rect) {
                 .search_results
                 .playlists
                 .iter()
-                .map(playlist_row)
+                .map(|playlist| playlist_row(playlist, model.theme))
                 .collect(),
         ),
     };
@@ -319,7 +325,11 @@ fn render_search_lane(model: &mut Model, frame: &mut Frame, area: Rect) {
 
 /// Render the playlists screen.
 fn render_playlists(model: &mut Model, frame: &mut Frame, area: Rect) {
-    let items = model.playlists.iter().map(playlist_row).collect();
+    let items = model
+        .playlists
+        .iter()
+        .map(|playlist| playlist_row(playlist, model.theme))
+        .collect();
     render_list(
         model,
         frame,
@@ -332,7 +342,11 @@ fn render_playlists(model: &mut Model, frame: &mut Frame, area: Rect) {
 
 /// Render the playlist-tracks screen.
 fn render_tracks(model: &mut Model, frame: &mut Frame, area: Rect) {
-    let items = model.tracks.iter().map(track_row).collect();
+    let items = model
+        .tracks
+        .iter()
+        .map(|track| track_row(track, model.theme))
+        .collect();
     render_list(
         model,
         frame,
@@ -352,35 +366,54 @@ fn render_library(model: &mut Model, frame: &mut Frame, area: Rect) {
         tabs,
         &labels,
         active_index(&LibraryTab::ALL, model.library_tab),
+        model.theme,
     );
 
     let empty = library_empty_hint(model.library_tab);
     let title = model.library_tab.label();
     match model.library_tab {
         LibraryTab::Albums => {
-            let items = model.albums.iter().map(album_row).collect();
+            let items = model
+                .albums
+                .iter()
+                .map(|album| album_row(album, model.theme))
+                .collect();
             render_list(model, frame, body, title, items, empty);
         }
         LibraryTab::TopArtists => {
-            let items = model.artists.iter().map(artist_row).collect();
+            let items = model
+                .artists
+                .iter()
+                .map(|artist| artist_row(artist, model.theme))
+                .collect();
             render_list(model, frame, body, title, items, empty);
         }
         LibraryTab::TopTracks | LibraryTab::RecentlyPlayed | LibraryTab::Saved => {
-            let items = model.tracks.iter().map(track_row).collect();
+            let items = model
+                .tracks
+                .iter()
+                .map(|track| track_row(track, model.theme))
+                .collect();
             render_list(model, frame, body, title, items, empty);
         }
     }
 }
 
 /// Render a one-line sub-tab bar with the active tab highlighted.
-fn render_subtab_bar(frame: &mut Frame, area: Rect, labels: &[&str], active: usize) {
+fn render_subtab_bar(
+    frame: &mut Frame,
+    area: Rect,
+    labels: &[&str],
+    active: usize,
+    theme: ThemeColors,
+) {
     let mut spans = Vec::new();
     for (index, label) in labels.iter().enumerate() {
         let span = Span::from(format!(" {label} "));
         spans.push(if index == active {
-            span.style(active_tab_style())
+            span.style(active_tab_style(theme))
         } else {
-            span.dim()
+            span.style(dim_style(theme))
         });
         spans.push(Span::from(" "));
     }
@@ -397,12 +430,16 @@ fn render_list(
     empty: &str,
 ) {
     if items.is_empty() {
-        frame.render_widget(Paragraph::new(empty.dim()).block(panel(title)), area);
+        frame.render_widget(
+            Paragraph::new(Span::from(empty.to_owned()).style(dim_style(model.theme)))
+                .block(panel(model.theme, title)),
+            area,
+        );
         return;
     }
     let list = List::new(items)
-        .block(panel(title))
-        .highlight_style(highlight_style())
+        .block(panel(model.theme, title))
+        .highlight_style(highlight_style(model.theme))
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, area, &mut model.list_state);
@@ -414,42 +451,40 @@ fn active_index<T: Copy + PartialEq>(all: &[T], current: T) -> usize {
 }
 
 /// Format a single playlist row as `Name · N tracks · Owner`.
-fn playlist_row(playlist: &PlaylistItem) -> ListItem<'static> {
+fn playlist_row(playlist: &PlaylistItem, theme: ThemeColors) -> ListItem<'static> {
     let line = Line::from(vec![
         Span::from(playlist.name.clone()),
-        Span::from(format!("  ·  {} tracks  ·  ", playlist.track_count)).dim(),
-        Span::from(playlist.owner.clone()).dim(),
+        Span::from(format!("  ·  {} tracks  ·  ", playlist.track_count)).style(dim_style(theme)),
+        Span::from(playlist.owner.clone()).style(dim_style(theme)),
     ]);
     ListItem::new(line)
 }
 
 /// Format a single track row as `Artist — Title   M:SS`.
-fn track_row(track: &TrackItem) -> ListItem<'static> {
+fn track_row(track: &TrackItem, theme: ThemeColors) -> ListItem<'static> {
     let line = Line::from(vec![
-        Span::from(track.artist.clone()).fg(SPOTIFY_GREEN),
-        Span::from("  —  ").dim(),
+        Span::from(track.artist.clone()).fg(theme.accent),
+        Span::from("  —  ").style(dim_style(theme)),
         Span::from(track.title.clone()),
         Span::from("   "),
-        Span::from(fmt_ms(track.duration_ms)).fg(INFO_ACCENT),
+        Span::from(fmt_ms(track.duration_ms)).fg(theme.progress),
     ]);
     ListItem::new(line)
 }
 
 /// Format a single album row as `Artist — Album`.
-fn album_row(album: &AlbumItem) -> ListItem<'static> {
+fn album_row(album: &AlbumItem, theme: ThemeColors) -> ListItem<'static> {
     let line = Line::from(vec![
-        Span::from(album.artist.clone()).fg(SPOTIFY_GREEN),
-        Span::from("  —  ").dim(),
+        Span::from(album.artist.clone()).fg(theme.accent),
+        Span::from("  —  ").style(dim_style(theme)),
         Span::from(album.name.clone()),
     ]);
     ListItem::new(line)
 }
 
 /// Format a single artist row.
-fn artist_row(artist: &ArtistItem) -> ListItem<'static> {
-    ListItem::new(Line::from(
-        Span::from(artist.name.clone()).fg(SPOTIFY_GREEN),
-    ))
+fn artist_row(artist: &ArtistItem, theme: ThemeColors) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::from(artist.name.clone()).fg(theme.accent)))
 }
 
 /// Empty-state hint for a Library sub-tab while its data loads.
@@ -470,7 +505,7 @@ fn library_empty_hint(tab: LibraryTab) -> &'static str {
 /// the title stays readable where it crosses the progress fill.
 fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
     let np = &model.now_playing;
-    let block = panel("Now Playing");
+    let block = panel(model.theme, "Now Playing");
     let inner = block.inner(area).inner(Margin {
         horizontal: 1,
         vertical: 0,
@@ -493,7 +528,7 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
     for y in inner.top()..inner.bottom() {
         for x in inner.left()..inner.left().saturating_add(filled) {
             let cell = &mut buf[(x, y)];
-            cell.set_bg(SPOTIFY_GREEN);
+            cell.set_bg(model.theme.progress);
             cell.set_fg(SPOTIFY_BLACK);
         }
     }
@@ -510,9 +545,9 @@ fn render_volume_overlay(model: &Model, frame: &mut Frame, area: Rect) {
     }
 
     let accent = if remaining <= VOLUME_FADE_WINDOW {
-        INFO_ACCENT_DIM
+        model.theme.dim
     } else {
-        INFO_ACCENT
+        model.theme.progress
     };
     let popup = volume_popup_area(area);
     frame.render_widget(Clear, popup);
@@ -534,7 +569,7 @@ fn render_volume_overlay(model: &Model, frame: &mut Frame, area: Rect) {
     let [label, gauge_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
     let label_line = Line::from(vec![
-        Span::from("vol ").dim(),
+        Span::from("vol ").style(dim_style(model.theme)),
         Span::from(format!("{}%", model.now_playing.volume))
             .fg(accent)
             .bold(),
@@ -542,7 +577,7 @@ fn render_volume_overlay(model: &Model, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(label_line), label);
     let gauge = Gauge::default()
         .percent(model.now_playing.volume.min(100))
-        .gauge_style(Style::new().fg(accent).bg(BORDER));
+        .gauge_style(Style::new().fg(accent).bg(model.theme.dim));
     frame.render_widget(gauge, gauge_area);
 }
 
@@ -625,21 +660,48 @@ fn render_help(model: &Model, frame: &mut Frame, area: Rect) {
         return;
     }
     let hint = match model.mode {
-        Mode::Insert => " Enter submit · Esc cancel ",
-        Mode::Normal => keys_for(model.screen),
+        Mode::Insert => " Enter submit · Esc cancel ".to_owned(),
+        Mode::Normal => keys_for(model),
     };
-    frame.render_widget(Paragraph::new(Line::from(hint).dim()), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(hint).style(dim_style(model.theme))),
+        area,
+    );
 }
 
 /// Keybinding hint string for the active screen in navigation mode.
-fn keys_for(screen: Screen) -> &'static str {
-    match screen {
-        Screen::Search => {
-            "/ edit · Tab lane · ↵ play · ␣ pause · n/p skip · ←/→ seek · -/+ vol · q quit"
-        }
-        Screen::Playlists => "↵ open · j/k move · ␣ pause · n/p skip · ←/→ seek · -/+ vol · q quit",
-        Screen::Tracks => "↵ play · Esc back · ␣ pause · n/p skip · ←/→ seek · -/+ vol · q quit",
-        Screen::Library => "Tab tab · ↵ play · ␣ pause · n/p skip · ←/→ seek · -/+ vol · q quit",
+fn keys_for(model: &Model) -> String {
+    let keys = &model.keybindings;
+    let play = key_label(keys.play_pause);
+    let skip = format!("{}/{}", key_label(keys.next), key_label(keys.previous));
+    let quit = key_label(keys.quit);
+    match model.screen {
+        Screen::Search => format!(
+            "{} edit · Tab lane · ↵ play · {} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            key_label(keys.search),
+            play,
+        ),
+        Screen::Playlists => format!(
+            "↵ open · {}/{} move · {} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            key_label(keys.down),
+            key_label(keys.up),
+            play,
+        ),
+        Screen::Tracks => format!(
+            "↵ play · Esc back · {play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+        ),
+        Screen::Library => format!(
+            "Tab tab · ↵ play · {play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+        ),
+    }
+}
+
+fn key_label(key: char) -> String {
+    match key {
+        ' ' => "Space".to_owned(),
+        '\t' => "Tab".to_owned(),
+        '\n' => "Enter".to_owned(),
+        _ => key.to_string(),
     }
 }
 
