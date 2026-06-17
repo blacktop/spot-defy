@@ -207,6 +207,14 @@ pub struct Model {
     pub search_results: SearchResultset,
     /// Latest now-playing snapshot rendered in the footer.
     pub now_playing: PlaybackSnapshot,
+    /// Track id currently loaded/expected by the app-side playback queue.
+    pub now_playing_track: Option<TrackId>,
+    /// Track id that supplied the current now-playing metadata/art.
+    pub now_playing_metadata_track: Option<TrackId>,
+    /// Metadata for the queue handed to the player by the last play action.
+    pub playback_queue: Vec<TrackItem>,
+    /// Cursor into `playback_queue` for the track expected to be loaded.
+    pub playback_queue_cursor: Option<usize>,
     /// Streaming-session health, tracking consecutive unavailable tracks so a
     /// dead session reconnects instead of skipping the whole queue.
     pub playback_health: PlaybackHealth,

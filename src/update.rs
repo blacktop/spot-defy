@@ -57,8 +57,8 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Action> {
         Message::TopArtistsLoaded(result) => top_artists_loaded(model, result),
         Message::PlaybackEvent(event) => playback_event(model, event),
         Message::TogglePlayPause => toggle_play_pause(model),
-        Message::NextTrack => vec![Action::PlayerNext],
-        Message::PrevTrack => vec![Action::PlayerPrev],
+        Message::NextTrack => next_track(model),
+        Message::PrevTrack => previous_track(model),
         Message::SeekRelative(delta) => seek_relative(model, delta),
         Message::VolumeDelta(delta) => volume_delta(model, delta),
         Message::NowPlayingRequested(reply) => now_playing_requested(model, reply),
@@ -337,10 +337,10 @@ fn transport_key(model: &mut Model, code: KeyCode) -> Vec<Action> {
         return toggle_play_pause(model);
     }
     if char_key(code, model.keybindings.next) {
-        return vec![Action::PlayerNext];
+        return next_track(model);
     }
     if char_key(code, model.keybindings.previous) {
-        return vec![Action::PlayerPrev];
+        return previous_track(model);
     }
     match code {
         KeyCode::Right | KeyCode::Char('l') => seek_relative(model, SEEK_STEP_MS),
@@ -497,8 +497,8 @@ fn activate_playlist(model: &mut Model, index: usize) -> Vec<Action> {
 
 /// Play the selected track from the playlist/library track list, queueing the
 /// whole list so next/previous walk it.
-fn activate_track(model: &Model, index: usize) -> Vec<Action> {
-    play_from(&model.tracks, index)
+fn activate_track(model: &mut Model, index: usize) -> Vec<Action> {
+    play_from(model, model.tracks.clone(), index)
 }
 
 /// Activate a Library row: play/drill into music content, or no-op on artists.
@@ -515,7 +515,7 @@ fn activate_library(model: &mut Model, index: usize) -> Vec<Action> {
 /// Activate a Search row based on the active lane.
 fn activate_search(model: &mut Model, index: usize) -> Vec<Action> {
     match model.search_tab {
-        SearchTab::Tracks => play_from(&model.search_results.tracks, index),
+        SearchTab::Tracks => play_from(model, model.search_results.tracks.clone(), index),
         SearchTab::Playlists => activate_search_playlist(model, index),
         SearchTab::Albums => activate_search_album(model, index),
         SearchTab::Artists => Vec::new(),
@@ -558,13 +558,54 @@ fn activate_search_album(model: &mut Model, index: usize) -> Vec<Action> {
     vec![Action::LoadAlbumTracks(id)]
 }
 
+/// Advance playback to the next queue entry, updating the expected track before
+/// the player emits events so stale events from the old track are ignored.
+fn next_track(model: &mut Model) -> Vec<Action> {
+    let mut actions = if expect_next_track(model) {
+        stage_expected_track(model)
+    } else {
+        Vec::new()
+    };
+    actions.push(Action::PlayerNext);
+    actions
+}
+
+/// Move playback to the previous queue entry, updating the expected track
+/// before the player emits events so stale events from the old track are
+/// ignored.
+fn previous_track(model: &mut Model) -> Vec<Action> {
+    let mut actions = if expect_previous_track(model) {
+        stage_expected_track(model)
+    } else {
+        Vec::new()
+    };
+    actions.push(Action::PlayerPrev);
+    actions
+}
+
 /// Build a player-load action that queues `tracks` and starts at `index`.
-fn play_from(tracks: &[crate::model::TrackItem], index: usize) -> Vec<Action> {
+fn play_from(model: &mut Model, tracks: Vec<crate::model::TrackItem>, index: usize) -> Vec<Action> {
     if index >= tracks.len() {
         return Vec::new();
     }
-    let queue = tracks.iter().map(|track| track.id.clone()).collect();
-    vec![Action::PlayerLoad { queue, index }]
+    model.playback_queue = tracks;
+    let Some(selected) = model
+        .playback_queue
+        .get(index)
+        .map(|track| track.id.clone())
+    else {
+        return Vec::new();
+    };
+    model.now_playing_track = Some(selected);
+    model.playback_queue_cursor = Some(index);
+    let queue = model
+        .playback_queue
+        .iter()
+        .map(|track| track.id.clone())
+        .collect();
+    let mut actions = stage_expected_track(model);
+    actions.push(Action::PlayerLoad { queue, index });
+    actions
 }
 
 /// Toggle between play and pause based on the current playback state.
@@ -613,34 +654,71 @@ fn playback_event(model: &mut Model, event: crate::player::PlaybackEvent) -> Vec
     use crate::player::PlaybackEvent as Ev;
     match event {
         Ev::Loading { track } => {
+            if !accept_track_event(model, &track) {
+                return Vec::new();
+            }
+            let changed = model.now_playing_metadata_track.as_ref() != Some(&track);
             apply_loading(model, &track);
-            let art = model
-                .find_track(&track)
-                .map(|track| track.album_art_images.clone())
-                .unwrap_or_default();
-            return vec![
-                Action::LoadAlbumArt(art),
-                Action::PublishNowPlaying(model.now_playing.clone()),
-            ];
+            if changed {
+                return track_identity_actions(model, &track);
+            }
         }
-        Ev::Playing { position_ms, .. } => {
+        Ev::Playing { track, position_ms } => {
+            if !accept_track_event(model, &track) {
+                return Vec::new();
+            }
+            let changed = sync_track_if_needed(model, &track);
             model.now_playing.state = PlaybackState::Playing;
             model.now_playing.position_ms = position_ms;
             // A successful play clears any in-progress skip/reconnect streak.
             model.playback_health = PlaybackHealth::Healthy;
+            if changed {
+                return track_identity_actions(model, &track);
+            }
         }
-        Ev::Paused { position_ms, .. } => {
+        Ev::Paused { track, position_ms } => {
+            if !accept_track_event(model, &track) {
+                return Vec::new();
+            }
+            let changed = sync_track_if_needed(model, &track);
             model.now_playing.state = PlaybackState::Paused;
             model.now_playing.position_ms = position_ms;
+            if changed {
+                return track_identity_actions(model, &track);
+            }
         }
-        Ev::PositionUpdate { position_ms } => model.now_playing.position_ms = position_ms,
+        Ev::PositionUpdate { position_ms } => {
+            if model.now_playing.state == PlaybackState::Loading {
+                return Vec::new();
+            }
+            model.now_playing.position_ms = position_ms;
+        }
         Ev::VolumeChanged { volume } => model.now_playing.volume = volume,
-        Ev::Stopped { .. } => apply_stopped(model),
-        Ev::PreloadNext { track } => {
-            return vec![Action::PlayerPreloadNext { current: track }];
+        Ev::Stopped { track } => {
+            if track.0.is_empty() || is_current_track(model, &track) {
+                apply_stopped(model);
+            } else {
+                return Vec::new();
+            }
         }
-        Ev::EndOfTrack { .. } => return vec![Action::PlayerNext],
-        Ev::Unavailable { .. } => return track_unavailable(model),
+        Ev::PreloadNext { track } => {
+            if is_current_track(model, &track) {
+                return vec![Action::PlayerPreloadNext { current: track }];
+            }
+            return Vec::new();
+        }
+        Ev::EndOfTrack { track } => {
+            if is_current_track(model, &track) {
+                return next_track(model);
+            }
+            return Vec::new();
+        }
+        Ev::Unavailable { track } => {
+            if is_current_track(model, &track) {
+                return track_unavailable(model);
+            }
+            return Vec::new();
+        }
         Ev::SessionDisconnected => return session_disconnected(model),
     }
     vec![Action::PublishNowPlaying(model.now_playing.clone())]
@@ -653,6 +731,9 @@ fn apply_stopped(model: &mut Model) {
         volume,
         ..PlaybackSnapshot::default()
     };
+    model.now_playing_track = None;
+    model.now_playing_metadata_track = None;
+    model.playback_queue_cursor = None;
     model.playback_health = PlaybackHealth::Healthy;
 }
 
@@ -668,6 +749,7 @@ fn track_unavailable(model: &mut Model) -> Vec<Action> {
         PlaybackHealth::Healthy => {
             model.playback_health = PlaybackHealth::Skipping(1);
             model.set_error("track unavailable here — skipping".to_owned());
+            let _ = expect_next_track(model);
             vec![Action::PlayerNext]
         }
         PlaybackHealth::Skipping(count) => {
@@ -679,6 +761,7 @@ fn track_unavailable(model: &mut Model) -> Vec<Action> {
             } else {
                 model.playback_health = PlaybackHealth::Skipping(count);
                 model.set_error("track unavailable here — skipping".to_owned());
+                let _ = expect_next_track(model);
                 vec![Action::PlayerNext]
             }
         }
@@ -694,6 +777,7 @@ fn track_unavailable(model: &mut Model) -> Vec<Action> {
                 Vec::new()
             } else {
                 model.playback_health = PlaybackHealth::Reconnecting(count);
+                let _ = expect_next_track(model);
                 vec![Action::PlayerNext]
             }
         }
@@ -717,16 +801,103 @@ fn session_disconnected(model: &mut Model) -> Vec<Action> {
 fn apply_loading(model: &mut Model, track: &TrackId) {
     model.now_playing.state = PlaybackState::Loading;
     model.now_playing.position_ms = 0;
+    sync_now_playing_track(model, track);
+}
+
+/// Apply metadata/list-position updates when a playback event points at a new
+/// track. Returns whether the visible now-playing identity changed.
+fn sync_track_if_needed(model: &mut Model, track: &TrackId) -> bool {
+    if model.now_playing_metadata_track.as_ref() == Some(track) {
+        return false;
+    }
+    sync_now_playing_track(model, track);
+    true
+}
+
+/// Update the now-playing identity from the current app-side queue or visible
+/// lists, clearing stale metadata if the track cannot be resolved.
+fn sync_now_playing_track(model: &mut Model, track: &TrackId) {
+    model.now_playing_track = Some(track.clone());
+    model.now_playing_metadata_track = Some(track.clone());
+    if let Some(index) = model
+        .playback_queue
+        .iter()
+        .position(|item| &item.id == track)
+    {
+        model.playback_queue_cursor = Some(index);
+    }
     follow_now_playing(model, track);
-    let Some((title, artist, duration_ms)) = model
-        .find_track(track)
+    let Some((title, artist, duration_ms)) = find_playback_track(model, track)
         .map(|item| (item.title.clone(), item.artist.clone(), item.duration_ms))
     else {
+        model.now_playing.track = None;
+        model.now_playing.artist = None;
+        model.now_playing.duration_ms = 0;
         return;
     };
     model.now_playing.track = Some(title);
     model.now_playing.artist = Some(artist);
     model.now_playing.duration_ms = duration_ms;
+}
+
+fn stage_expected_track(model: &mut Model) -> Vec<Action> {
+    let Some(track) = model.now_playing_track.clone() else {
+        return Vec::new();
+    };
+    apply_loading(model, &track);
+    track_identity_actions(model, &track)
+}
+
+fn track_identity_actions(model: &Model, track: &TrackId) -> Vec<Action> {
+    vec![
+        Action::LoadAlbumArt(album_art_for(model, track)),
+        Action::PublishNowPlaying(model.now_playing.clone()),
+    ]
+}
+
+fn album_art_for(model: &Model, track: &TrackId) -> Vec<crate::model::AlbumArtImage> {
+    find_playback_track(model, track)
+        .map(|track| track.album_art_images.clone())
+        .unwrap_or_default()
+}
+
+fn is_current_track(model: &Model, track: &TrackId) -> bool {
+    model.now_playing_track.as_ref() == Some(track)
+}
+
+fn accept_track_event(model: &Model, track: &TrackId) -> bool {
+    model
+        .now_playing_track
+        .as_ref()
+        .is_none_or(|expected| expected == track)
+}
+
+fn expect_next_track(model: &mut Model) -> bool {
+    let Some(cursor) = model.playback_queue_cursor else {
+        return false;
+    };
+    let next = cursor + 1;
+    let Some(track) = model.playback_queue.get(next) else {
+        return false;
+    };
+    model.playback_queue_cursor = Some(next);
+    model.now_playing_track = Some(track.id.clone());
+    true
+}
+
+fn expect_previous_track(model: &mut Model) -> bool {
+    let Some(cursor) = model.playback_queue_cursor else {
+        return false;
+    };
+    let Some(previous) = cursor.checked_sub(1) else {
+        return false;
+    };
+    let Some(track) = model.playback_queue.get(previous) else {
+        return false;
+    };
+    model.playback_queue_cursor = Some(previous);
+    model.now_playing_track = Some(track.id.clone());
+    true
 }
 
 /// Move the list selection to follow the now-playing `track` when it appears in
@@ -738,6 +909,25 @@ fn follow_now_playing(model: &mut Model, track: &TrackId) {
     if let Some(index) = position {
         model.list_state.select(Some(index));
     }
+}
+
+/// Resolve metadata for the active playback queue first, then any currently
+/// visible/loaded track list. This prevents a previous list with the same id
+/// from supplying stale title/art for a newly launched queue.
+fn find_playback_track<'a>(
+    model: &'a Model,
+    track: &TrackId,
+) -> Option<&'a crate::model::TrackItem> {
+    model
+        .playback_queue
+        .iter()
+        .find(|item| &item.id == track)
+        .or_else(|| {
+            active_track_list(model)
+                .iter()
+                .find(|item| &item.id == track)
+        })
+        .or_else(|| model.find_track(track))
 }
 
 /// The track list currently shown on screen, or an empty slice when the active

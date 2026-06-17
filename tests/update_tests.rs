@@ -10,8 +10,8 @@
 use spot_defy::api::SearchResultset;
 use spot_defy::message::{Action, Message};
 use spot_defy::model::{
-    AlbumId, AlbumItem, ArtistId, ArtistItem, PlaybackSnapshot, PlaybackState, PlaylistId,
-    PlaylistItem, TimeRange, TrackId, TrackItem, TrackListSource,
+    AlbumArtImage, AlbumId, AlbumItem, ArtistId, ArtistItem, PlaybackSnapshot, PlaybackState,
+    PlaylistId, PlaylistItem, TimeRange, TrackId, TrackItem, TrackListSource,
 };
 use spot_defy::player::PlaybackEvent;
 use spot_defy::state::{LibraryTab, Mode, Model, Screen, SearchTab};
@@ -28,6 +28,38 @@ fn track(id: &str, title: &str) -> TrackItem {
         duration_ms: 120_000,
         album_art_images: Vec::new(),
     }
+}
+
+fn set_current(model: &mut Model, id: &str) {
+    model.now_playing_track = Some(TrackId(id.to_owned()));
+}
+
+fn track_ids(ids: &[&str]) -> Vec<TrackId> {
+    ids.iter().map(|id| TrackId((*id).to_owned())).collect()
+}
+
+fn assert_loading_actions(actions: &[Action], title: &str, art: &[AlbumArtImage]) {
+    assert!(matches!(&actions[0], Action::LoadAlbumArt(images) if images == art));
+    assert!(
+        matches!(&actions[1], Action::PublishNowPlaying(snapshot) if snapshot.track.as_deref() == Some(title) && snapshot.state == PlaybackState::Loading)
+    );
+}
+
+fn assert_player_load(action: &Action, queue: &[&str], index: usize) {
+    let expected_queue = track_ids(queue);
+    assert!(matches!(
+        action,
+        Action::PlayerLoad {
+            queue: actual_queue,
+            index: actual_index,
+        } if actual_queue == &expected_queue && *actual_index == index
+    ));
+}
+
+fn assert_now_playing_identity(model: &Model, id: &str) {
+    let expected = TrackId(id.to_owned());
+    assert_eq!(model.now_playing_track.as_ref(), Some(&expected));
+    assert_eq!(model.now_playing_metadata_track.as_ref(), Some(&expected));
 }
 
 /// Build a playlist fixture.
@@ -186,13 +218,10 @@ fn activate_track_loads_player() {
     model.tracks = vec![track("t1", "Song")];
     model.list_state.select(Some(0));
     let actions = update(&mut model, Message::ActivateSelection);
-    assert_eq!(
-        actions,
-        vec![Action::PlayerLoad {
-            queue: vec![TrackId("t1".to_owned())],
-            index: 0,
-        }]
-    );
+    assert_loading_actions(&actions, "Song", &[]);
+    assert_player_load(&actions[2], &["t1"], 0);
+    assert_now_playing_identity(&model, "t1");
+    assert_eq!(model.playback_queue, vec![track("t1", "Song")]);
 }
 
 #[test]
@@ -232,6 +261,77 @@ fn next_prev_messages_emit_actions() {
         update(&mut model, Message::PrevTrack),
         vec![Action::PlayerPrev]
     );
+}
+
+#[test]
+fn manual_next_sets_expected_track_before_player_events() {
+    let mut model = Model::new();
+    let mut next = track("t2", "Next");
+    next.album_art_images = vec![AlbumArtImage {
+        url: "https://example.invalid/next.jpg".to_owned(),
+        width: Some(300),
+        height: Some(300),
+    }];
+    model.playback_queue = vec![track("t1", "Current"), next.clone()];
+    model.playback_queue_cursor = Some(0);
+    set_current(&mut model, "t1");
+
+    let actions = update(&mut model, Message::NextTrack);
+    assert_loading_actions(&actions, "Next", &next.album_art_images);
+    assert!(matches!(actions[2], Action::PlayerNext));
+    assert_now_playing_identity(&model, "t2");
+    assert_eq!(model.playback_queue_cursor, Some(1));
+
+    let stale_end = PlaybackEvent::EndOfTrack {
+        track: TrackId("t1".to_owned()),
+    };
+    assert!(update(&mut model, Message::PlaybackEvent(stale_end)).is_empty());
+}
+
+#[test]
+fn manual_next_ignores_stale_position_update_while_loading_next_track() {
+    let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "Current"), track("t2", "Next")];
+    model.playback_queue_cursor = Some(0);
+    model.now_playing.position_ms = 118_000;
+    set_current(&mut model, "t1");
+
+    let actions = update(&mut model, Message::NextTrack);
+
+    assert!(matches!(actions[2], Action::PlayerNext));
+    assert_eq!(model.now_playing.track.as_deref(), Some("Next"));
+    assert_eq!(model.now_playing.state, PlaybackState::Loading);
+    assert_eq!(model.now_playing.position_ms, 0);
+
+    let actions = update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::PositionUpdate {
+            position_ms: 119_000,
+        }),
+    );
+
+    assert!(actions.is_empty());
+    assert_eq!(model.now_playing.position_ms, 0);
+}
+
+#[test]
+fn manual_previous_sets_expected_track_before_player_events() {
+    let mut model = Model::new();
+    let mut previous = track("t1", "Previous");
+    previous.album_art_images = vec![AlbumArtImage {
+        url: "https://example.invalid/previous.jpg".to_owned(),
+        width: Some(300),
+        height: Some(300),
+    }];
+    model.playback_queue = vec![previous.clone(), track("t2", "Current")];
+    model.playback_queue_cursor = Some(1);
+    set_current(&mut model, "t2");
+
+    let actions = update(&mut model, Message::PrevTrack);
+    assert_loading_actions(&actions, "Previous", &previous.album_art_images);
+    assert!(matches!(actions[2], Action::PlayerPrev));
+    assert_now_playing_identity(&model, "t1");
+    assert_eq!(model.playback_queue_cursor, Some(0));
 }
 
 #[test]
@@ -308,6 +408,7 @@ fn playback_loading_event_fills_now_playing() {
 #[test]
 fn end_of_track_advances_queue() {
     let mut model = Model::new();
+    set_current(&mut model, "t1");
     let event = PlaybackEvent::EndOfTrack {
         track: TrackId("t1".to_owned()),
     };
@@ -319,6 +420,7 @@ fn end_of_track_advances_queue() {
 fn preload_hint_prefetches_next_queue_item() {
     let mut model = Model::new();
     let current = TrackId("t1".to_owned());
+    model.now_playing_track = Some(current.clone());
     let event = PlaybackEvent::PreloadNext {
         track: current.clone(),
     };
@@ -331,6 +433,7 @@ fn preload_hint_prefetches_next_queue_item() {
 #[test]
 fn unavailable_event_skips_to_next_with_status() {
     let mut model = Model::new();
+    set_current(&mut model, "t1");
     let event = PlaybackEvent::Unavailable {
         track: TrackId("t1".to_owned()),
     };
@@ -349,6 +452,7 @@ fn unavailable_event_skips_to_next_with_status() {
 #[test]
 fn repeated_unavailable_triggers_reconnect_not_endless_skip() {
     let mut model = Model::new();
+    set_current(&mut model, "t");
     let unavailable = || {
         Message::PlaybackEvent(PlaybackEvent::Unavailable {
             track: TrackId("t".to_owned()),
@@ -369,12 +473,16 @@ fn repeated_unavailable_triggers_reconnect_not_endless_skip() {
 #[test]
 fn successful_play_resets_the_unavailable_streak() {
     let mut model = Model::new();
+    model.playback_queue = vec![track("t", "Unavailable"), track("ok", "Ok")];
+    model.playback_queue_cursor = Some(0);
+    set_current(&mut model, "t");
     let unavailable = || {
         Message::PlaybackEvent(PlaybackEvent::Unavailable {
             track: TrackId("t".to_owned()),
         })
     };
-    update(&mut model, unavailable());
+    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    assert_eq!(model.now_playing_track, Some(TrackId("ok".to_owned())));
     update(
         &mut model,
         Message::PlaybackEvent(PlaybackEvent::Playing {
@@ -383,6 +491,7 @@ fn successful_play_resets_the_unavailable_streak() {
         }),
     );
     // After a track plays, the next failure starts over at a skip, not reconnect.
+    set_current(&mut model, "t");
     assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
 }
 
@@ -401,6 +510,7 @@ fn session_disconnect_requests_reconnect_once() {
 #[test]
 fn unavailable_after_reconnect_is_bounded_then_stops() {
     let mut model = Model::new();
+    set_current(&mut model, "t");
     let unavailable = || {
         Message::PlaybackEvent(PlaybackEvent::Unavailable {
             track: TrackId("t".to_owned()),
@@ -480,6 +590,53 @@ fn loading_event_moves_selection_to_now_playing_track() {
 }
 
 #[test]
+fn playing_event_for_preloaded_next_updates_metadata_art_and_highlight() {
+    let mut model = Model::new();
+    model.screen = Screen::Library;
+    model.library_tab = LibraryTab::Saved;
+    let mut next = track("t2", "Next");
+    next.album_art_images = vec![AlbumArtImage {
+        url: "https://example.invalid/cover.jpg".to_owned(),
+        width: Some(300),
+        height: Some(300),
+    }];
+    model.tracks = vec![track("t1", "Current"), next.clone()];
+    model.playback_queue = model.tracks.clone();
+    model.playback_queue_cursor = Some(0);
+    model.now_playing_track = Some(TrackId("t1".to_owned()));
+    model.now_playing_metadata_track = Some(TrackId("t1".to_owned()));
+    model.now_playing.track = Some("Current".to_owned());
+    model.list_state.select(Some(0));
+
+    let end_actions = update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::EndOfTrack {
+            track: TrackId("t1".to_owned()),
+        }),
+    );
+    assert_loading_actions(&end_actions, "Next", &next.album_art_images);
+    assert!(matches!(end_actions[2], Action::PlayerNext));
+    assert_eq!(model.now_playing_track, Some(TrackId("t2".to_owned())));
+
+    let actions = update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::Playing {
+            track: TrackId("t2".to_owned()),
+            position_ms: 250,
+        }),
+    );
+
+    assert_eq!(model.now_playing.track.as_deref(), Some("Next"));
+    assert_now_playing_identity(&model, "t2");
+    assert_eq!(model.now_playing.position_ms, 250);
+    assert_eq!(model.list_state.selected(), Some(1));
+    assert_eq!(model.playback_queue_cursor, Some(1));
+    assert!(
+        matches!(actions.as_slice(), [Action::PublishNowPlaying(snapshot)] if snapshot.state == PlaybackState::Playing)
+    );
+}
+
+#[test]
 fn position_update_advances_footer() {
     let mut model = Model::new();
     let event = PlaybackEvent::PositionUpdate { position_ms: 7_500 };
@@ -490,6 +647,7 @@ fn position_update_advances_footer() {
 #[test]
 fn stopped_event_clears_now_playing_and_publishes_snapshot() {
     let mut model = Model::new();
+    set_current(&mut model, "t1");
     model.now_playing = PlaybackSnapshot {
         track: Some("Song".to_owned()),
         artist: Some("Artist".to_owned()),
@@ -629,12 +787,105 @@ fn activate_search_track_plays_from_results() {
     };
     model.list_state.select(Some(0));
     let actions = update(&mut model, Message::ActivateSelection);
-    assert_eq!(
-        actions,
-        vec![Action::PlayerLoad {
-            queue: vec![TrackId("t1".to_owned())],
-            index: 0,
-        }]
+    assert_loading_actions(&actions, "Song", &[]);
+    assert_player_load(&actions[2], &["t1"], 0);
+    assert_now_playing_identity(&model, "t1");
+    assert_eq!(model.playback_queue, vec![track("t1", "Song")]);
+}
+
+#[test]
+fn stale_end_of_track_after_manual_selection_is_ignored() {
+    let mut model = Model::new();
+    model.screen = Screen::Library;
+    model.library_tab = LibraryTab::Saved;
+    model.tracks = vec![
+        track("old", "Old"),
+        track("selected", "Selected"),
+        track("next", "Next"),
+    ];
+    model.now_playing_track = Some(TrackId("old".to_owned()));
+    model.list_state.select(Some(1));
+
+    let actions = update(&mut model, Message::ActivateSelection);
+
+    assert_loading_actions(&actions, "Selected", &[]);
+    assert_player_load(&actions[2], &["old", "selected", "next"], 1);
+    assert_now_playing_identity(&model, "selected");
+
+    let stale_end = Message::PlaybackEvent(PlaybackEvent::EndOfTrack {
+        track: TrackId("old".to_owned()),
+    });
+    assert!(update(&mut model, stale_end).is_empty());
+}
+
+#[test]
+fn stale_playing_after_manual_selection_is_ignored() {
+    let mut model = Model::new();
+    model.screen = Screen::Library;
+    model.library_tab = LibraryTab::Saved;
+    model.tracks = vec![
+        track("old", "Old"),
+        track("selected", "Selected"),
+        track("next", "Next"),
+    ];
+    model.now_playing_track = Some(TrackId("old".to_owned()));
+    model.list_state.select(Some(1));
+
+    let actions = update(&mut model, Message::ActivateSelection);
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            Action::LoadAlbumArt(_),
+            Action::PublishNowPlaying(_),
+            Action::PlayerLoad { index: 1, .. }
+        ]
+    ));
+
+    let stale_playing = Message::PlaybackEvent(PlaybackEvent::Playing {
+        track: TrackId("old".to_owned()),
+        position_ms: 119_000,
+    });
+    assert!(update(&mut model, stale_playing).is_empty());
+    assert_now_playing_identity(&model, "selected");
+    assert_eq!(model.list_state.selected(), Some(1));
+}
+
+#[test]
+fn playing_event_for_manual_selection_updates_stale_metadata_without_loading() {
+    let mut model = Model::new();
+    model.screen = Screen::Library;
+    model.library_tab = LibraryTab::Saved;
+    let mut selected = track("selected", "Selected");
+    selected.album_art_images = vec![AlbumArtImage {
+        url: "https://example.invalid/selected.jpg".to_owned(),
+        width: Some(300),
+        height: Some(300),
+    }];
+    model.tracks = vec![track("old", "Old"), selected.clone(), track("next", "Next")];
+    model.now_playing_track = Some(TrackId("old".to_owned()));
+    model.now_playing_metadata_track = Some(TrackId("old".to_owned()));
+    model.now_playing.track = Some("Old".to_owned());
+    model.list_state.select(Some(1));
+
+    let actions = update(&mut model, Message::ActivateSelection);
+    assert_loading_actions(&actions, "Selected", &selected.album_art_images);
+    assert_player_load(&actions[2], &["old", "selected", "next"], 1);
+    assert_eq!(model.now_playing.track.as_deref(), Some("Selected"));
+    assert_now_playing_identity(&model, "selected");
+
+    let actions = update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::Playing {
+            track: TrackId("selected".to_owned()),
+            position_ms: 100,
+        }),
+    );
+
+    assert_eq!(model.now_playing.track.as_deref(), Some("Selected"));
+    assert_now_playing_identity(&model, "selected");
+    assert_eq!(model.list_state.selected(), Some(1));
+    assert!(
+        matches!(actions.as_slice(), [Action::PublishNowPlaying(snapshot)] if snapshot.state == PlaybackState::Playing)
     );
 }
 
