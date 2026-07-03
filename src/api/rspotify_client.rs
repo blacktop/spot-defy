@@ -10,17 +10,16 @@
 use crate::api::{SEARCH_LIMIT_MAX, SpotifyApi};
 use crate::error::ApiError;
 use crate::model::{
-    AlbumArtImage, AlbumId, AlbumItem, ArtistId, ArtistItem, PlaybackSnapshot, PlaybackState,
-    PlaylistId, PlaylistItem, TimeRange, TrackId, TrackItem,
+    AlbumArtImage, AlbumId, AlbumItem, ArtistId, ArtistItem, PlaylistId, PlaylistItem, TimeRange,
+    TrackId, TrackItem,
 };
 use async_trait::async_trait;
-use chrono::Duration as ChronoDuration;
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::http::HttpError;
 use rspotify::model::{
-    AdditionalType, AlbumId as RsAlbumId, CurrentPlaybackContext, Device, FullAlbum, FullArtist,
-    FullTrack, PlayableItem, PlaylistId as RsPlaylistId, SearchResult, SearchType, SimplifiedAlbum,
-    SimplifiedArtist, SimplifiedPlaylist, SimplifiedTrack, TimeRange as RsTimeRange,
+    AlbumId as RsAlbumId, FullAlbum, FullArtist, FullTrack, PlayableItem,
+    PlaylistId as RsPlaylistId, SearchResult, SearchType, SimplifiedAlbum, SimplifiedArtist,
+    SimplifiedPlaylist, SimplifiedTrack, TimeRange as RsTimeRange,
 };
 use rspotify::prelude::Id as _;
 use rspotify::{AuthCodePkceSpotify, ClientError, Token};
@@ -74,112 +73,6 @@ impl RspotifyApi {
     #[must_use]
     pub fn client(&self) -> &AuthCodePkceSpotify {
         &self.client
-    }
-
-    /// List the available Spotify Connect devices for this account.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if the request fails or the response is malformed.
-    pub async fn devices(&self) -> Result<Vec<Device>, ApiError> {
-        self.client.device().await.map_err(map_client_error)
-    }
-
-    /// Transfer playback to `device_id`, optionally forcing play.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if the transfer request fails.
-    pub async fn transfer_playback(
-        &self,
-        device_id: &str,
-        play: Option<bool>,
-    ) -> Result<(), ApiError> {
-        self.client
-            .transfer_playback(device_id, play)
-            .await
-            .map_err(map_client_error)
-    }
-
-    /// Resume playback on the active (or given) device.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if the request fails (e.g. no active device, 404).
-    pub async fn resume(&self, device_id: Option<&str>) -> Result<(), ApiError> {
-        self.client
-            .resume_playback(device_id, None)
-            .await
-            .map_err(map_client_error)
-    }
-
-    /// Pause playback on the active (or given) device.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if the request fails.
-    pub async fn pause(&self, device_id: Option<&str>) -> Result<(), ApiError> {
-        self.client
-            .pause_playback(device_id)
-            .await
-            .map_err(map_client_error)
-    }
-
-    /// Skip to the next track on the active (or given) device.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if the request fails.
-    pub async fn next(&self, device_id: Option<&str>) -> Result<(), ApiError> {
-        self.client
-            .next_track(device_id)
-            .await
-            .map_err(map_client_error)
-    }
-
-    /// Skip to the previous track on the active (or given) device.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if the request fails.
-    pub async fn previous(&self, device_id: Option<&str>) -> Result<(), ApiError> {
-        self.client
-            .previous_track(device_id)
-            .await
-            .map_err(map_client_error)
-    }
-
-    /// Seek the active track to `position_ms`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if the request fails or `position_ms` overflows the
-    /// signed-millisecond range used by the underlying API.
-    pub async fn seek(&self, position_ms: u32, device_id: Option<&str>) -> Result<(), ApiError> {
-        let position =
-            ChronoDuration::try_milliseconds(i64::from(position_ms)).ok_or_else(|| {
-                ApiError::Mapping(format!("seek position out of range: {position_ms}"))
-            })?;
-        self.client
-            .seek_track(position, device_id)
-            .await
-            .map_err(map_client_error)
-    }
-
-    /// Set the output volume (0..=100) on the active (or given) device.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ApiError`] if `volume` exceeds 100 or the request fails.
-    pub async fn set_volume(&self, volume: u16, device_id: Option<&str>) -> Result<(), ApiError> {
-        let percent = u8::try_from(volume)
-            .ok()
-            .filter(|v| *v <= 100)
-            .ok_or_else(|| ApiError::Mapping(format!("volume must be 0..=100, got {volume}")))?;
-        self.client
-            .volume(percent, device_id)
-            .await
-            .map_err(map_client_error)
     }
 }
 
@@ -356,14 +249,6 @@ impl SpotifyApi for RspotifyApi {
             .iter()
             .map(|track| map_album_track(track, &album.name, &art))
             .collect())
-    }
-
-    async fn current_playback(&self) -> Result<Option<PlaybackSnapshot>, ApiError> {
-        let additional = [AdditionalType::Track];
-        let context = self
-            .retrying(|| self.client.current_playback(None, Some(&additional)))
-            .await?;
-        Ok(context.as_ref().map(map_playback_context))
     }
 
     async fn set_access_token(&self, access_token: SecretString) {
@@ -558,36 +443,6 @@ fn map_playlist_item(item: &rspotify::model::PlaylistItem) -> Option<TrackItem> 
     }
 }
 
-/// Map the current playback context into a [`PlaybackSnapshot`].
-fn map_playback_context(context: &CurrentPlaybackContext) -> PlaybackSnapshot {
-    let track = match context.item.as_ref() {
-        Some(PlayableItem::Track(t)) => Some(t),
-        Some(PlayableItem::Episode(_) | PlayableItem::Unknown(_)) | None => None,
-    };
-    let duration_ms = track.map_or(0, |t| {
-        u32::try_from(t.duration.num_milliseconds().max(0)).unwrap_or(u32::MAX)
-    });
-    let position_ms = context.progress.map_or(0, |p| {
-        u32::try_from(p.num_milliseconds().max(0)).unwrap_or(u32::MAX)
-    });
-    let state = if context.is_playing {
-        PlaybackState::Playing
-    } else if track.is_some() {
-        PlaybackState::Paused
-    } else {
-        PlaybackState::Stopped
-    };
-    let volume = u16::try_from(context.device.volume_percent.unwrap_or(0).min(100)).unwrap_or(100);
-    PlaybackSnapshot {
-        track: track.map(|t| t.name.clone()),
-        artist: track.map(|t| join_artists(&t.artists)),
-        state,
-        position_ms,
-        duration_ms,
-        volume,
-    }
-}
-
 /// Build a [`ApiError`] for a search response whose payload variant did not
 /// match the requested type (defensive — Spotify echoes the requested `type`).
 fn unexpected_search_result(expected: &str, got: &SearchResult) -> ApiError {
@@ -660,14 +515,13 @@ fn classify_status(status: u16, retry_after_secs: Option<u64>) -> ApiError {
 mod tests {
     use crate::api::rspotify_client::{
         album_art_images, classify_status, join_artists, map_full_artist, map_full_track,
-        map_playback_context, map_playlist_item, map_simplified_album, map_simplified_playlist,
-        to_rs_time_range,
+        map_playlist_item, map_simplified_album, map_simplified_playlist, to_rs_time_range,
     };
     use crate::error::ApiError;
-    use crate::model::{PlaybackState, TimeRange};
+    use crate::model::TimeRange;
     use rspotify::model::{
-        CurrentPlaybackContext, FullArtist, FullTrack, PlaylistItem as RsPlaylistItem,
-        SimplifiedAlbum, SimplifiedArtist, SimplifiedPlaylist, TimeRange as RsTimeRange,
+        FullArtist, FullTrack, PlaylistItem as RsPlaylistItem, SimplifiedAlbum, SimplifiedArtist,
+        SimplifiedPlaylist, TimeRange as RsTimeRange,
     };
 
     fn full_track_json() -> serde_json::Value {
@@ -842,42 +696,6 @@ mod tests {
             "track": null, "item": null
         }));
         assert!(map_playlist_item(&empty).is_none());
-    }
-
-    #[test]
-    fn maps_playback_context_playing() {
-        let context: CurrentPlaybackContext = parse(serde_json::json!({
-            "device": {"id": "d1", "is_active": true, "is_private_session": false,
-                "is_restricted": false, "name": "Mac", "type": "Computer",
-                "volume_percent": 73},
-            "repeat_state": "off", "shuffle_state": false, "context": null,
-            "timestamp": 1_700_000_000_000_i64, "progress_ms": 42_000,
-            "is_playing": true, "item": full_track_json(),
-            "currently_playing_type": "track",
-            "actions": {"disallows": {}}
-        }));
-        let snap = map_playback_context(&context);
-        assert_eq!(snap.state, PlaybackState::Playing);
-        assert_eq!(snap.track.as_deref(), Some("Feel This Moment"));
-        assert_eq!(snap.artist.as_deref(), Some("Pitbull, Christina Aguilera"));
-        assert_eq!(snap.position_ms, 42_000);
-        assert_eq!(snap.duration_ms, 229_400);
-        assert_eq!(snap.volume, 73);
-    }
-
-    #[test]
-    fn maps_playback_context_paused_when_not_playing() {
-        let context: CurrentPlaybackContext = parse(serde_json::json!({
-            "device": {"id": "d1", "is_active": true, "is_private_session": false,
-                "is_restricted": false, "name": "Mac", "type": "Computer",
-                "volume_percent": 10},
-            "repeat_state": "off", "shuffle_state": false, "context": null,
-            "timestamp": 1_700_000_000_000_i64, "progress_ms": 1000,
-            "is_playing": false, "item": full_track_json(),
-            "currently_playing_type": "track",
-            "actions": {"disallows": {}}
-        }));
-        assert_eq!(map_playback_context(&context).state, PlaybackState::Paused);
     }
 
     #[test]

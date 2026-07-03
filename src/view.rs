@@ -9,13 +9,14 @@
 
 use crate::config::{SPOTIFY_BLACK, ThemeColors};
 use crate::model::{AlbumItem, ArtistItem, PlaybackState, PlaylistItem, TrackItem};
-use crate::state::{LibraryTab, Mode, Model, Screen, SearchTab};
+use crate::state::{LibraryTab, LoadPhase, Mode, Model, Screen, SearchTab};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Clear, Gauge, HighlightSpacing, List, ListItem, Paragraph,
+    Block, BorderType, Clear, Gauge, HighlightSpacing, List, ListItem, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState,
 };
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{FontSize, Resize, StatefulImage};
@@ -211,7 +212,7 @@ fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
         (Screen::Library, "3 Library"),
     ] {
         let span = Span::from(format!(" {label} "));
-        spans.push(if screen == active_tab(model.screen) {
+        spans.push(if screen == active_tab(model) {
             span.style(active_tab_style(model.theme))
         } else {
             span.style(dim_style(model.theme))
@@ -225,11 +226,16 @@ fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
-/// Map the active screen onto its owning top-level tab.
-fn active_tab(screen: Screen) -> Screen {
-    match screen {
-        Screen::Tracks => Screen::Playlists,
-        Screen::Search | Screen::Playlists | Screen::Library => screen,
+/// Map the active screen onto its owning top-level tab. A drilled-in track
+/// list highlights the tab it was entered from, not always Playlists.
+fn active_tab(model: &Model) -> Screen {
+    match model.screen {
+        Screen::Tracks => match model.tracks_origin {
+            Screen::Search => Screen::Search,
+            Screen::Library => Screen::Library,
+            Screen::Playlists | Screen::Tracks => Screen::Playlists,
+        },
+        Screen::Search | Screen::Playlists | Screen::Library => model.screen,
     }
 }
 
@@ -250,15 +256,31 @@ fn render_search(model: &mut Model, frame: &mut Frame, area: Rect) {
             key_label(model.keybindings.search)
         )
     };
+    // Measure by display width (CJK/emoji are two cells). When the query
+    // outgrows the box in insert mode, scroll the text so the cursor stays
+    // over the character actually being edited instead of pinning blind at
+    // the right edge.
+    let inner_width = usize::from(input.width.saturating_sub(2));
+    let cursor_width = UnicodeWidthStr::width(&model.search.query[..model.search.cursor]);
+    let scroll = if model.mode == Mode::Insert {
+        cursor_width.saturating_sub(inner_width.saturating_sub(1))
+    } else {
+        0
+    };
     frame.render_widget(
-        Paragraph::new(model.search.query.as_str()).block(panel(model.theme, &title)),
+        Paragraph::new(model.search.query.as_str())
+            .scroll((0, u16::try_from(scroll).unwrap_or(u16::MAX)))
+            .block(panel(model.theme, &title)),
         input,
     );
 
     if model.mode == Mode::Insert {
-        let offset = u16::try_from(model.search.query[..model.search.cursor].chars().count())
-            .unwrap_or(u16::MAX);
-        let cursor_x = input.x.saturating_add(1).saturating_add(offset);
+        let offset = u16::try_from(cursor_width - scroll).unwrap_or(u16::MAX);
+        let cursor_x = input
+            .x
+            .saturating_add(1)
+            .saturating_add(offset)
+            .min(input.right().saturating_sub(2));
         frame.set_cursor_position((cursor_x, input.y + 1));
     }
 
@@ -313,14 +335,37 @@ fn render_search_lane(model: &mut Model, frame: &mut Frame, area: Rect) {
                 .collect(),
         ),
     };
-    render_list(
-        model,
-        frame,
-        area,
-        title,
-        items,
-        "No results yet. Press / to search.",
-    );
+    // A lane whose query failed must not masquerade as a genuine zero-match.
+    let lane_failed = model.search_results.failed_lanes.contains(&title);
+    let empty = if lane_failed {
+        search_retry_hint(model)
+    } else {
+        match model.search_phase {
+            LoadPhase::Idle => "No results yet. Press / to search.",
+            LoadPhase::Loading => "Searching…",
+            LoadPhase::Loaded(_) => "No results for this query.",
+            LoadPhase::Failed => search_retry_hint(model),
+        }
+    };
+    render_list(model, frame, area, title, items, empty);
+}
+
+/// Retry hint for a failed search, honest about which key actually retries.
+fn search_retry_hint(model: &Model) -> &'static str {
+    if model.keybindings.uses('r') {
+        "Search failed — edit the query and press Enter."
+    } else {
+        "Search failed — press r to retry."
+    }
+}
+
+/// Retry hint for a failed list load, honest about which key actually retries.
+fn load_retry_hint(model: &Model) -> &'static str {
+    if model.keybindings.uses('r') {
+        "Couldn't load — leave and re-enter to retry."
+    } else {
+        "Couldn't load — press r to retry."
+    }
 }
 
 /// Render the playlists screen.
@@ -330,31 +375,27 @@ fn render_playlists(model: &mut Model, frame: &mut Frame, area: Rect) {
         .iter()
         .map(|playlist| playlist_row(playlist, model.theme))
         .collect();
-    render_list(
-        model,
-        frame,
-        area,
-        "Playlists",
-        items,
-        "No playlists found.",
-    );
+    let empty = match model.playlists_phase {
+        LoadPhase::Idle | LoadPhase::Loading => "Loading playlists…",
+        LoadPhase::Loaded(_) => "No playlists found.",
+        LoadPhase::Failed => load_retry_hint(model),
+    };
+    render_list(model, frame, area, "Playlists", items, empty);
 }
 
-/// Render the playlist-tracks screen.
+/// Render the drilled-in track-list screen (playlist or album).
 fn render_tracks(model: &mut Model, frame: &mut Frame, area: Rect) {
     let items = model
         .tracks
         .iter()
         .map(|track| track_row(track, model.theme))
         .collect();
-    render_list(
-        model,
-        frame,
-        area,
-        "Tracks",
-        items,
-        "This playlist has no tracks.",
-    );
+    let empty = match model.tracks_phase {
+        LoadPhase::Idle | LoadPhase::Loading => "Loading tracks…",
+        LoadPhase::Loaded(_) => "No tracks here.",
+        LoadPhase::Failed => load_retry_hint(model),
+    };
+    render_list(model, frame, area, "Tracks", items, empty);
 }
 
 /// Render the library/discovery screen: sub-tab bar, then the active tab.
@@ -369,7 +410,14 @@ fn render_library(model: &mut Model, frame: &mut Frame, area: Rect) {
         model.theme,
     );
 
-    let empty = library_empty_hint(model.library_tab);
+    let phase = match model.library_tab {
+        LibraryTab::Albums => model.albums_phase,
+        LibraryTab::TopArtists => model.artists_phase,
+        LibraryTab::TopTracks | LibraryTab::RecentlyPlayed | LibraryTab::Saved => {
+            model.tracks_phase
+        }
+    };
+    let empty = library_empty_hint(model.library_tab, phase, load_retry_hint(model));
     let title = model.library_tab.label();
     match model.library_tab {
         LibraryTab::Albums => {
@@ -421,6 +469,9 @@ fn render_subtab_bar(
 }
 
 /// Render a selectable list, or an empty-state hint when there are no rows.
+///
+/// Non-empty lists get a `selected/total` counter in the bottom border and,
+/// when the rows overflow the pane, a scrollbar on the right edge.
 fn render_list(
     model: &mut Model,
     frame: &mut Frame,
@@ -437,12 +488,30 @@ fn render_list(
         );
         return;
     }
+    let len = items.len();
+    let selected = model.list_state.selected().unwrap_or(0).min(len - 1);
+    let counter = Line::from(format!(" {}/{len} ", selected + 1))
+        .right_aligned()
+        .style(dim_style(model.theme));
     let list = List::new(items)
-        .block(panel(model.theme, title))
+        .block(panel(model.theme, title).title_bottom(counter))
         .highlight_style(highlight_style(model.theme))
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, area, &mut model.list_state);
+
+    let viewport = usize::from(area.height.saturating_sub(2));
+    if len > viewport && viewport > 0 {
+        let mut scrollbar_state = ScrollbarState::new(len).position(selected);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight).style(dim_style(model.theme)),
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 }
 
 /// The index of `current` within `all` (defaulting to the first tab).
@@ -487,14 +556,26 @@ fn artist_row(artist: &ArtistItem, theme: ThemeColors) -> ListItem<'static> {
     ListItem::new(Line::from(Span::from(artist.name.clone()).fg(theme.accent)))
 }
 
-/// Empty-state hint for a Library sub-tab while its data loads.
-fn library_empty_hint(tab: LibraryTab) -> &'static str {
-    match tab {
-        LibraryTab::TopTracks => "Loading your top tracks…",
-        LibraryTab::Albums => "Loading your albums…",
-        LibraryTab::TopArtists => "Loading your top artists…",
-        LibraryTab::RecentlyPlayed => "Loading recently played…",
-        LibraryTab::Saved => "Loading your saved tracks…",
+/// Empty-state hint for a Library sub-tab, honest about its load phase.
+/// `retry` is the caller-selected copy for the failed state (see
+/// [`load_retry_hint`]).
+fn library_empty_hint(tab: LibraryTab, phase: LoadPhase, retry: &'static str) -> &'static str {
+    match phase {
+        LoadPhase::Idle | LoadPhase::Loading => match tab {
+            LibraryTab::TopTracks => "Loading your top tracks…",
+            LibraryTab::Albums => "Loading your albums…",
+            LibraryTab::TopArtists => "Loading your top artists…",
+            LibraryTab::RecentlyPlayed => "Loading recently played…",
+            LibraryTab::Saved => "Loading your saved tracks…",
+        },
+        LoadPhase::Loaded(_) => match tab {
+            LibraryTab::TopTracks => "No top tracks yet.",
+            LibraryTab::Albums => "No saved albums.",
+            LibraryTab::TopArtists => "No top artists yet.",
+            LibraryTab::RecentlyPlayed => "Nothing played recently.",
+            LibraryTab::Saved => "No saved tracks.",
+        },
+        LoadPhase::Failed => retry,
     }
 }
 
@@ -675,23 +756,25 @@ fn keys_for(model: &Model) -> String {
     let play = key_label(keys.play_pause);
     let skip = format!("{}/{}", key_label(keys.next), key_label(keys.previous));
     let quit = key_label(keys.quit);
+    // Only advertise the hardcoded refresh key while it is actually free.
+    let refresh = if keys.uses('r') { "" } else { "r refresh · " };
     match model.screen {
         Screen::Search => format!(
-            "{} edit · Tab lane · ↵ play · {} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            "{} edit · Tab lane · ↵ play · {refresh}{} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
             key_label(keys.search),
             play,
         ),
         Screen::Playlists => format!(
-            "↵ open · {}/{} move · {} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            "↵ open · {}/{} move · {refresh}{} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
             key_label(keys.down),
             key_label(keys.up),
             play,
         ),
         Screen::Tracks => format!(
-            "↵ play · Esc back · {play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            "↵ play · Esc back · {refresh}{play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
         ),
         Screen::Library => format!(
-            "Tab tab · ↵ play · {play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            "Tab tab · ↵ play · {refresh}{play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
         ),
     }
 }

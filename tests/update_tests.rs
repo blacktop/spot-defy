@@ -750,11 +750,28 @@ fn search_results_populate_every_lane() {
         albums: vec![album("al1", "Album")],
         artists: vec![artist("ar1", "Artist")],
         playlists: vec![playlist("pl1", "Mix")],
+        ..SearchResultset::default()
     });
     update(&mut model, Message::SearchResults(result));
     assert_eq!(model.search_results.albums.len(), 1);
     assert_eq!(model.search_results.artists.len(), 1);
     assert_eq!(model.search_results.playlists.len(), 1);
+}
+
+#[test]
+fn partially_failed_search_surfaces_the_failed_lanes() {
+    let mut model = Model::new();
+    // Tracks succeeded, playlists lane failed upstream: results still render,
+    // but the failure is named in the status bar rather than swallowed.
+    let result = Ok(SearchResultset {
+        tracks: vec![track("t1", "A")],
+        failed_lanes: vec!["Playlists"],
+        ..SearchResultset::default()
+    });
+    update(&mut model, Message::SearchResults(result));
+    assert_eq!(model.search_results.tracks.len(), 1);
+    let status = model.status.expect("partial failure must set a status");
+    assert!(status.contains("Playlists"), "status names the failed lane");
 }
 
 #[test]
@@ -960,4 +977,109 @@ fn api_error_surfaces_status_message() {
     let result = Err(spot_defy::error::ApiError::Response("403".to_owned()));
     update(&mut model, Message::PlaylistsLoaded(result));
     assert!(model.status.is_some());
+}
+
+#[test]
+fn reentering_playlists_reuses_fresh_data() {
+    use spot_defy::state::LoadPhase;
+    let mut model = Model::new();
+    // First entry requests a load.
+    let actions = update(&mut model, Message::EnterScreen(Screen::Playlists));
+    assert_eq!(actions, vec![Action::LoadPlaylists]);
+    // While the request is in flight, re-entering does not stack another.
+    assert!(update(&mut model, Message::EnterScreen(Screen::Playlists)).is_empty());
+    // Once the response lands, re-entry within the TTL reuses it.
+    let result = Ok(vec![playlist("p1", "Mix")]);
+    update(&mut model, Message::PlaylistsLoaded(result));
+    assert!(matches!(model.playlists_phase, LoadPhase::Loaded(_)));
+    assert!(update(&mut model, Message::EnterScreen(Screen::Playlists)).is_empty());
+}
+
+#[test]
+fn failed_playlist_load_retries_on_reentry() {
+    use spot_defy::error::ApiError;
+    use spot_defy::state::LoadPhase;
+    let mut model = Model::new();
+    update(&mut model, Message::EnterScreen(Screen::Playlists));
+    let result = Err(ApiError::Request("network down".to_owned()));
+    update(&mut model, Message::PlaylistsLoaded(result));
+    assert_eq!(model.playlists_phase, LoadPhase::Failed);
+    // A failed load is not fresh: entering the screen again retries.
+    let actions = update(&mut model, Message::EnterScreen(Screen::Playlists));
+    assert_eq!(actions, vec![Action::LoadPlaylists]);
+}
+
+#[test]
+fn drilling_into_a_playlist_shows_loading_not_stale_tracks() {
+    use spot_defy::state::LoadPhase;
+    let mut model = Model::new();
+    model.screen = Screen::Playlists;
+    model.playlists = vec![playlist("p1", "Mix")];
+    model.tracks = vec![track("old", "Left over from another list")];
+    model.list_state.select(Some(0));
+
+    let actions = update(&mut model, Message::ActivateSelection);
+
+    assert_eq!(
+        actions,
+        vec![Action::LoadPlaylistTracks(PlaylistId("p1".to_owned()))]
+    );
+    assert!(
+        model.tracks.is_empty(),
+        "stale tracks must not show while the new list loads"
+    );
+    assert_eq!(model.tracks_phase, LoadPhase::Loading);
+    assert_eq!(model.screen, Screen::Tracks);
+}
+
+#[test]
+fn reopening_the_same_playlist_within_ttl_is_instant() {
+    let mut model = Model::new();
+    model.screen = Screen::Playlists;
+    model.playlists = vec![playlist("p1", "Mix")];
+    model.list_state.select(Some(0));
+    update(&mut model, Message::ActivateSelection);
+    update(
+        &mut model,
+        Message::TrackListLoaded {
+            source: TrackListSource::Playlist(PlaylistId("p1".to_owned())),
+            result: Ok(vec![track("t1", "Song")]),
+        },
+    );
+    // Esc back out, then re-open the same playlist: served from cache.
+    update(&mut model, Message::EnterScreen(Screen::Playlists));
+    model.list_state.select(Some(0));
+    let actions = update(&mut model, Message::ActivateSelection);
+    assert!(
+        actions.is_empty(),
+        "fresh same-source drill-in needs no load"
+    );
+    assert_eq!(model.screen, Screen::Tracks);
+    assert_eq!(model.tracks.len(), 1);
+}
+
+#[test]
+fn track_response_landing_after_esc_is_kept_for_reentry() {
+    let mut model = Model::new();
+    model.screen = Screen::Playlists;
+    model.playlists = vec![playlist("p1", "Mix"), playlist("p2", "Other")];
+    model.list_state.select(Some(1));
+    update(&mut model, Message::ActivateSelection);
+    // The user bails back to Playlists before the tracks arrive.
+    update(&mut model, Message::EnterScreen(Screen::Playlists));
+    model.list_state.select(Some(0));
+    update(
+        &mut model,
+        Message::TrackListLoaded {
+            source: TrackListSource::Playlist(PlaylistId("p2".to_owned())),
+            result: Ok(vec![track("t9", "Nine")]),
+        },
+    );
+    // The late response must not clobber the Playlists cursor…
+    assert_eq!(model.list_state.selected(), Some(0));
+    // …but the data is cached, so re-opening that playlist is instant.
+    model.list_state.select(Some(1));
+    let actions = update(&mut model, Message::ActivateSelection);
+    assert!(actions.is_empty());
+    assert_eq!(model.tracks.len(), 1);
 }

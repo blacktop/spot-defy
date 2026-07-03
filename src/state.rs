@@ -9,7 +9,7 @@ use crate::model::{
     AlbumItem, ArtistItem, PlaybackSnapshot, PlaylistItem, TrackId, TrackItem, TrackListSource,
 };
 use ratatui::widgets::ListState;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Top-level screen the user is currently viewing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,6 +33,35 @@ pub enum Mode {
     Normal,
     /// Key presses edit the search query.
     Insert,
+}
+
+/// Lifecycle of a remotely-fetched dataset backing a screen or tab.
+///
+/// Distinguishes "never asked" from "request in flight", "data present", and
+/// "last request failed", so empty views can say the true thing and screen
+/// entries can skip reloading data that is already fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadPhase {
+    /// Never requested (or explicitly invalidated).
+    #[default]
+    Idle,
+    /// A request is in flight.
+    Loading,
+    /// Data arrived at the recorded instant (drives the reload TTL).
+    Loaded(Instant),
+    /// The last request failed; a retry must be explicit.
+    Failed,
+}
+
+impl LoadPhase {
+    /// Whether data is present and younger than `ttl`.
+    #[must_use]
+    pub fn is_fresh(self, ttl: Duration) -> bool {
+        match self {
+            LoadPhase::Loaded(at) => at.elapsed() < ttl,
+            LoadPhase::Idle | LoadPhase::Loading | LoadPhase::Failed => false,
+        }
+    }
 }
 
 /// Health of the streaming playback session.
@@ -195,16 +224,28 @@ pub struct Model {
     pub list_state: ListState,
     /// Loaded playlists (Playlists screen).
     pub playlists: Vec<PlaylistItem>,
+    /// Load lifecycle of `playlists`.
+    pub playlists_phase: LoadPhase,
     /// Loaded tracks (playlist tracks or the track-based Library tabs).
     pub tracks: Vec<TrackItem>,
     /// Source that most recently requested ownership of `tracks`.
     pub track_list_source: Option<TrackListSource>,
+    /// Load lifecycle of `tracks` (for the current `track_list_source`).
+    pub tracks_phase: LoadPhase,
     /// Loaded artists (the Library "Top Artists" tab).
     pub artists: Vec<ArtistItem>,
+    /// Load lifecycle of `artists`.
+    pub artists_phase: LoadPhase,
     /// Loaded saved albums (the Library "Albums" tab).
     pub albums: Vec<AlbumItem>,
+    /// Load lifecycle of `albums`.
+    pub albums_phase: LoadPhase,
     /// The latest multi-lane search results (Search screen).
     pub search_results: SearchResultset,
+    /// Load lifecycle of `search_results`.
+    pub search_phase: LoadPhase,
+    /// Screen the user drilled into `Screen::Tracks` from; `Esc` returns there.
+    pub tracks_origin: Screen,
     /// Latest now-playing snapshot rendered in the footer.
     pub now_playing: PlaybackSnapshot,
     /// Track id currently loaded/expected by the app-side playback queue.

@@ -105,6 +105,25 @@ impl Default for Keybindings {
     }
 }
 
+impl Keybindings {
+    /// Whether `c` is taken by one of the configured bindings. Hardcoded keys
+    /// (like the `r` refresh) yield to user bindings, and the help hints must
+    /// not advertise a hardcoded key the user has claimed.
+    #[must_use]
+    pub fn uses(&self, c: char) -> bool {
+        [
+            self.quit,
+            self.down,
+            self.up,
+            self.play_pause,
+            self.next,
+            self.previous,
+            self.search,
+        ]
+        .contains(&c)
+    }
+}
+
 /// Named-color theme for the TUI.
 ///
 /// Colors are stored as ratatui color names (e.g. `"green"`, `"cyan"`) so the

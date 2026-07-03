@@ -45,10 +45,6 @@ pub enum ApiError {
     /// A response payload could not be mapped into a `crate::model` type.
     #[error("failed to map spotify response: {0}")]
     Mapping(String),
-
-    /// The requested capability is not yet implemented.
-    #[error("api capability not implemented: {0}")]
-    NotImplemented(&'static str),
 }
 
 /// Errors raised by the streaming/playback layer (`crate::player`).
@@ -69,10 +65,6 @@ pub enum PlayerError {
     /// The audio backend could not be initialized.
     #[error("audio backend error: {0}")]
     AudioBackend(String),
-
-    /// The requested capability is not yet implemented.
-    #[error("player capability not implemented: {0}")]
-    NotImplemented(&'static str),
 }
 
 /// Errors raised by the now-playing IPC layer (`crate::ipc`).

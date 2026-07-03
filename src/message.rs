@@ -7,7 +7,6 @@
 
 use crate::api::SearchResultset;
 use crate::error::ApiError;
-use crate::ipc::NowPlayingPayload;
 use crate::model::{
     AlbumArtImage, AlbumId, AlbumItem, ArtistItem, PlaybackSnapshot, PlaylistId, PlaylistItem,
     TimeRange, TrackId, TrackItem, TrackListSource,
@@ -15,7 +14,6 @@ use crate::model::{
 use crate::player::PlaybackEvent;
 use crate::state::Screen;
 use crossterm::event::KeyEvent;
-use tokio::sync::oneshot;
 
 /// An event delivered to the pure `update` reducer.
 #[derive(Debug)]
@@ -75,8 +73,6 @@ pub enum Message {
     SeekRelative(i32),
     /// Change the app (librespot) volume by a relative percentage.
     VolumeDelta(i16),
-    /// An IPC client asked for the current now-playing line.
-    NowPlayingRequested(oneshot::Sender<NowPlayingPayload>),
     /// A non-fatal error to surface in the UI.
     Error(String),
 }

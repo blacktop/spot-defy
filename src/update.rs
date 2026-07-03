@@ -4,10 +4,9 @@
 //! side effects the event loop should run. Keeping it pure makes the UI
 //! behavior unit-testable without network, keychain, or terminal.
 
-use crate::ipc::NowPlayingPayload;
 use crate::message::{Action, Message};
 use crate::model::{PlaybackSnapshot, PlaybackState, TimeRange, TrackId, TrackListSource};
-use crate::state::{LibraryTab, Mode, Model, PlaybackHealth, Screen, SearchTab};
+use crate::state::{LibraryTab, LoadPhase, Mode, Model, PlaybackHealth, Screen, SearchTab};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 
@@ -27,6 +26,13 @@ const VOLUME_OVERLAY_MS: u64 = 1_200;
 /// rather than continuing to skip. One region-locked track is skipped; this
 /// many failures in a row means the session is dead, not the tracks.
 const RECONNECT_AFTER_FAILURES: u32 = 2;
+
+/// Library/playlist data younger than this is reused on re-entry instead of
+/// refetched, sparing the rate-limited shared client id; `r` forces a reload.
+const LIBRARY_TTL: Duration = Duration::from_secs(300);
+
+/// Rows jumped by one PageUp/PageDown press.
+const PAGE_STEP: usize = 15;
 
 /// Apply `msg` to `model`, returning the actions to execute.
 ///
@@ -61,7 +67,6 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Action> {
         Message::PrevTrack => previous_track(model),
         Message::SeekRelative(delta) => seek_relative(model, delta),
         Message::VolumeDelta(delta) => volume_delta(model, delta),
-        Message::NowPlayingRequested(reply) => now_playing_requested(model, reply),
         // Window resize is handled by the next draw, not the Model.
         Message::Resize(..) => Vec::new(),
         Message::Error(text) => {
@@ -96,14 +101,31 @@ fn search_results(
 ) -> Vec<Action> {
     match result {
         Ok(results) => {
+            // Partial failures still render, but never silently: name the
+            // lanes that failed in the status bar.
+            if !results.failed_lanes.is_empty() {
+                let retry = if model.keybindings.uses('r') {
+                    "edit the query and press Enter"
+                } else {
+                    "press r to retry"
+                };
+                model.set_error(format!(
+                    "search failed for {}; {retry}",
+                    results.failed_lanes.join(", ")
+                ));
+            }
             model.search_results = results;
+            model.search_phase = LoadPhase::Loaded(Instant::now());
             // Only move the cursor if the user is still on this screen; a late
             // response must not clobber the selection of a screen they left.
             if model.screen == Screen::Search {
                 model.reset_selection();
             }
         }
-        Err(err) => model.set_error(format!("search failed: {err}")),
+        Err(err) => {
+            model.search_phase = LoadPhase::Failed;
+            model.set_error(format!("search failed: {err}"));
+        }
     }
     Vec::new()
 }
@@ -116,11 +138,15 @@ fn top_artists_loaded(
     match result {
         Ok(artists) => {
             model.artists = artists;
+            model.artists_phase = LoadPhase::Loaded(Instant::now());
             if model.screen == Screen::Library && model.library_tab == LibraryTab::TopArtists {
                 model.reset_selection();
             }
         }
-        Err(err) => model.set_error(format!("loading top artists failed: {err}")),
+        Err(err) => {
+            model.artists_phase = LoadPhase::Failed;
+            model.set_error(format!("loading top artists failed: {err}"));
+        }
     }
     Vec::new()
 }
@@ -133,11 +159,15 @@ fn albums_loaded(
     match result {
         Ok(albums) => {
             model.albums = albums;
+            model.albums_phase = LoadPhase::Loaded(Instant::now());
             if model.screen == Screen::Library && model.library_tab == LibraryTab::Albums {
                 model.reset_selection();
             }
         }
-        Err(err) => model.set_error(format!("loading albums failed: {err}")),
+        Err(err) => {
+            model.albums_phase = LoadPhase::Failed;
+            model.set_error(format!("loading albums failed: {err}"));
+        }
     }
     Vec::new()
 }
@@ -150,42 +180,53 @@ fn playlists_loaded(
     match result {
         Ok(playlists) => {
             model.playlists = playlists;
+            model.playlists_phase = LoadPhase::Loaded(Instant::now());
             if model.screen == Screen::Playlists {
                 model.reset_selection();
             }
         }
-        Err(err) => model.set_error(format!("loading playlists failed: {err}")),
+        Err(err) => {
+            model.playlists_phase = LoadPhase::Failed;
+            model.set_error(format!("loading playlists failed: {err}"));
+        }
     }
     Vec::new()
 }
 
 /// Store a loaded track list (playlist tracks, top tracks, recent, or saved).
 ///
-/// A load error is always surfaced, but loaded tracks only replace the list
-/// when the response still owns the active view — a stale response (the user
-/// navigated away) must not overwrite what they are now looking at.
+/// A load error is always surfaced. Data (and its load phase) is stored when
+/// `source` still owns `model.tracks` — a stale response for a source the user
+/// has since navigated away from is dropped. The selection cursor is only
+/// touched when the track view is actually on screen.
 fn tracks_loaded(
     model: &mut Model,
     source: &TrackListSource,
     result: Result<Vec<crate::model::TrackItem>, crate::error::ApiError>,
 ) -> Vec<Action> {
+    let owns = model.track_list_source.as_ref() == Some(source);
     match result {
         Ok(tracks) => {
-            if accept_track_list_response(model, source) {
+            if owns {
                 model.tracks = tracks;
-                model.reset_selection();
+                model.tracks_phase = LoadPhase::Loaded(Instant::now());
+                if track_view_active(model, source) {
+                    model.reset_selection();
+                }
             }
         }
-        Err(err) => model.set_error(format!("loading tracks failed: {err}")),
+        Err(err) => {
+            model.set_error(format!("loading tracks failed: {err}"));
+            if owns {
+                model.tracks_phase = LoadPhase::Failed;
+            }
+        }
     }
     Vec::new()
 }
 
-/// Accept only the track-list response that still owns the active track view.
-fn accept_track_list_response(model: &Model, source: &TrackListSource) -> bool {
-    if model.track_list_source.as_ref() != Some(source) {
-        return false;
-    }
+/// Whether the track view fed by `source` is what the user is looking at.
+fn track_view_active(model: &Model, source: &TrackListSource) -> bool {
     matches!(
         (model.screen, model.library_tab, source),
         (
@@ -245,6 +286,9 @@ fn key_press(model: &mut Model, key: KeyEvent) -> Vec<Action> {
 
 /// Handle keys while editing the search box.
 fn key_press_insert(model: &mut Model, key: KeyEvent) -> Vec<Action> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        return search_clear(model);
+    }
     match key.code {
         KeyCode::Esc => exit_insert(model),
         KeyCode::Enter => {
@@ -252,6 +296,17 @@ fn key_press_insert(model: &mut Model, key: KeyEvent) -> Vec<Action> {
             search_submit(model)
         }
         KeyCode::Backspace => search_backspace(model),
+        KeyCode::Delete => search_delete(model),
+        KeyCode::Left => search_cursor_left(model),
+        KeyCode::Right => search_cursor_right(model),
+        KeyCode::Home => {
+            model.search.cursor = 0;
+            Vec::new()
+        }
+        KeyCode::End => {
+            model.search.cursor = model.search.query.len();
+            Vec::new()
+        }
         KeyCode::Char(c) => search_input_char(model, c),
         _ => Vec::new(),
     }
@@ -310,6 +365,10 @@ fn global_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
         KeyCode::Char('1') => Some(enter_screen(model, Screen::Search)),
         KeyCode::Char('2') => Some(enter_screen(model, Screen::Playlists)),
         KeyCode::Char('3') => Some(enter_screen(model, Screen::Library)),
+        // Force-reload the active view, bypassing the freshness cache. Yields
+        // to a user binding so a configured `r` keeps its configured meaning
+        // (the help hints stop advertising `r` in that case too).
+        KeyCode::Char('r') if !model.keybindings.uses('r') => Some(refresh_active(model)),
         _ => None,
     }
 }
@@ -325,10 +384,28 @@ fn navigation_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
     match code {
         KeyCode::Home | KeyCode::Char('g') => Some(select_first(model)),
         KeyCode::End | KeyCode::Char('G') => Some(select_last(model)),
+        KeyCode::PageDown => Some(select_page(model, true)),
+        KeyCode::PageUp => Some(select_page(model, false)),
         KeyCode::Enter => Some(activate_selection(model)),
         KeyCode::Esc => Some(escape(model)),
         _ => None,
     }
+}
+
+/// Jump the selection a page's worth of rows, clamped to the list bounds.
+fn select_page(model: &mut Model, forward: bool) -> Vec<Action> {
+    let len = model.active_len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let current = model.list_state.selected().unwrap_or(0);
+    let target = if forward {
+        (current + PAGE_STEP).min(len - 1)
+    } else {
+        current.saturating_sub(PAGE_STEP)
+    };
+    model.list_state.select(Some(target));
+    Vec::new()
 }
 
 /// Playback transport keys (play/pause, skip, seek).
@@ -355,10 +432,11 @@ fn char_key(code: KeyCode, binding: char) -> bool {
     matches!(code, KeyCode::Char(key) if key == binding)
 }
 
-/// `Esc` in navigation mode steps back out of a drilled-in playlist.
+/// `Esc` in navigation mode steps back out of a drilled-in track list, to
+/// whichever screen the user drilled in from (playlists, library, or search).
 fn escape(model: &mut Model) -> Vec<Action> {
     if model.screen == Screen::Tracks {
-        return enter_screen(model, Screen::Playlists);
+        return enter_screen(model, model.tracks_origin);
     }
     Vec::new()
 }
@@ -373,7 +451,9 @@ fn tick(model: &mut Model) -> Vec<Action> {
     Vec::new()
 }
 
-/// Switch screens and kick off any load action the screen needs.
+/// Switch screens and kick off any load action the screen needs. Loads are
+/// skipped when the target's data is already fresh or in flight (see
+/// [`LIBRARY_TTL`]); `r` forces a reload via [`refresh_active`].
 fn enter_screen(model: &mut Model, screen: Screen) -> Vec<Action> {
     let changed = model.screen != screen;
     model.screen = screen;
@@ -384,42 +464,103 @@ fn enter_screen(model: &mut Model, screen: Screen) -> Vec<Action> {
         model.mode = Mode::Normal;
     }
     match screen {
-        Screen::Playlists => {
-            model.track_list_source = None;
-            vec![Action::LoadPlaylists]
-        }
+        Screen::Playlists => request_playlists(model, false),
         Screen::Library => library_load_action(model, model.library_tab),
-        Screen::Search => {
-            model.track_list_source = None;
-            Vec::new()
-        }
-        Screen::Tracks => Vec::new(),
+        Screen::Search | Screen::Tracks => Vec::new(),
     }
 }
 
-/// The load action that populates a given Library sub-tab.
+/// The load action that populates a given Library sub-tab (cache-aware).
 fn library_load_action(model: &mut Model, tab: LibraryTab) -> Vec<Action> {
+    library_tab_request(model, tab, false)
+}
+
+/// Request a Library sub-tab's data, honoring the freshness cache unless forced.
+fn library_tab_request(model: &mut Model, tab: LibraryTab, force: bool) -> Vec<Action> {
     match tab {
-        LibraryTab::TopTracks => {
-            let range = TimeRange::default();
-            model.track_list_source = Some(TrackListSource::TopTracks(range));
-            vec![Action::LoadTopTracks(range)]
-        }
-        LibraryTab::Albums => {
-            model.track_list_source = None;
-            vec![Action::LoadSavedAlbums]
-        }
-        LibraryTab::TopArtists => {
-            model.track_list_source = None;
-            vec![Action::LoadTopArtists(TimeRange::default())]
-        }
-        LibraryTab::RecentlyPlayed => {
-            model.track_list_source = Some(TrackListSource::RecentlyPlayed);
-            vec![Action::LoadRecentlyPlayed]
-        }
-        LibraryTab::Saved => {
-            model.track_list_source = Some(TrackListSource::SavedTracks);
-            vec![Action::LoadSavedTracks]
+        LibraryTab::TopTracks => track_tab_load(
+            model,
+            TrackListSource::TopTracks(TimeRange::default()),
+            force,
+        ),
+        LibraryTab::Albums => request_albums(model, force),
+        LibraryTab::TopArtists => request_artists(model, force),
+        LibraryTab::RecentlyPlayed => track_tab_load(model, TrackListSource::RecentlyPlayed, force),
+        LibraryTab::Saved => track_tab_load(model, TrackListSource::SavedTracks, force),
+    }
+}
+
+/// Whether a dataset in `phase` needs a request (not in flight, not fresh).
+fn should_request(phase: LoadPhase, force: bool) -> bool {
+    force || !(phase == LoadPhase::Loading || phase.is_fresh(LIBRARY_TTL))
+}
+
+/// Request the user's playlists unless they are already fresh or loading.
+fn request_playlists(model: &mut Model, force: bool) -> Vec<Action> {
+    if !should_request(model.playlists_phase, force) {
+        return Vec::new();
+    }
+    model.playlists_phase = LoadPhase::Loading;
+    vec![Action::LoadPlaylists]
+}
+
+/// Request saved albums unless they are already fresh or loading.
+fn request_albums(model: &mut Model, force: bool) -> Vec<Action> {
+    if !should_request(model.albums_phase, force) {
+        return Vec::new();
+    }
+    model.albums_phase = LoadPhase::Loading;
+    vec![Action::LoadSavedAlbums]
+}
+
+/// Request top artists unless they are already fresh or loading.
+fn request_artists(model: &mut Model, force: bool) -> Vec<Action> {
+    if !should_request(model.artists_phase, force) {
+        return Vec::new();
+    }
+    model.artists_phase = LoadPhase::Loading;
+    vec![Action::LoadTopArtists(TimeRange::default())]
+}
+
+/// Point `model.tracks` at `source`, loading it unless the same source is
+/// already fresh or in flight. Switching sources clears the stale list so the
+/// view shows a loading state instead of the previous source's rows.
+fn track_tab_load(model: &mut Model, source: TrackListSource, force: bool) -> Vec<Action> {
+    let same = model.track_list_source.as_ref() == Some(&source);
+    if same && !should_request(model.tracks_phase, force) {
+        return Vec::new();
+    }
+    if !same {
+        model.tracks.clear();
+    }
+    model.track_list_source = Some(source.clone());
+    model.tracks_phase = LoadPhase::Loading;
+    vec![source_load_action(source)]
+}
+
+/// The [`Action`] that fetches a given track-list source.
+fn source_load_action(source: TrackListSource) -> Action {
+    match source {
+        TrackListSource::Playlist(id) => Action::LoadPlaylistTracks(id),
+        TrackListSource::Album(id) => Action::LoadAlbumTracks(id),
+        TrackListSource::TopTracks(range) => Action::LoadTopTracks(range),
+        TrackListSource::RecentlyPlayed => Action::LoadRecentlyPlayed,
+        TrackListSource::SavedTracks => Action::LoadSavedTracks,
+    }
+}
+
+/// Force-reload whatever the active screen/tab is showing (`r`).
+fn refresh_active(model: &mut Model) -> Vec<Action> {
+    match model.screen {
+        Screen::Playlists => request_playlists(model, true),
+        Screen::Library => library_tab_request(model, model.library_tab, true),
+        Screen::Search => search_submit(model),
+        Screen::Tracks => {
+            let Some(source) = model.track_list_source.clone() else {
+                return Vec::new();
+            };
+            model.tracks_phase = LoadPhase::Loading;
+            vec![source_load_action(source)]
         }
     }
 }
@@ -453,6 +594,49 @@ fn search_backspace(model: &mut Model) -> Vec<Action> {
     Vec::new()
 }
 
+/// Delete the character at (after) the cursor and re-arm the debounce.
+fn search_delete(model: &mut Model) -> Vec<Action> {
+    let Some(next) = model.search.query[model.search.cursor..].chars().next() else {
+        return Vec::new();
+    };
+    let end = model.search.cursor + next.len_utf8();
+    model
+        .search
+        .query
+        .replace_range(model.search.cursor..end, "");
+    model.search.last_input = std::time::Instant::now();
+    model.search.pending = !model.search.query.is_empty();
+    Vec::new()
+}
+
+/// Clear the whole query (Ctrl-U), leaving the results untouched.
+fn search_clear(model: &mut Model) -> Vec<Action> {
+    model.search.query.clear();
+    model.search.cursor = 0;
+    model.search.pending = false;
+    Vec::new()
+}
+
+/// Move the edit cursor one character left.
+fn search_cursor_left(model: &mut Model) -> Vec<Action> {
+    let step = model.search.query[..model.search.cursor]
+        .chars()
+        .next_back()
+        .map_or(0, char::len_utf8);
+    model.search.cursor -= step;
+    Vec::new()
+}
+
+/// Move the edit cursor one character right.
+fn search_cursor_right(model: &mut Model) -> Vec<Action> {
+    let step = model.search.query[model.search.cursor..]
+        .chars()
+        .next()
+        .map_or(0, char::len_utf8);
+    model.search.cursor += step;
+    Vec::new()
+}
+
 /// Submit the search immediately, bypassing the debounce.
 fn search_submit(model: &mut Model) -> Vec<Action> {
     model.search.pending = false;
@@ -460,10 +644,11 @@ fn search_submit(model: &mut Model) -> Vec<Action> {
 }
 
 /// Build the search action for the current query, or nothing when it is empty.
-fn search_action(model: &Model) -> Vec<Action> {
+fn search_action(model: &mut Model) -> Vec<Action> {
     if model.search.query.is_empty() {
         return Vec::new();
     }
+    model.search_phase = LoadPhase::Loading;
     vec![Action::Search {
         query: model.search.query.clone(),
         limit: crate::api::SEARCH_LIMIT_MAX,
@@ -489,10 +674,17 @@ fn activate_playlist(model: &mut Model, index: usize) -> Vec<Action> {
         return Vec::new();
     };
     let id = playlist.id.clone();
-    model.track_list_source = Some(TrackListSource::Playlist(id.clone()));
+    drill_into_tracks(model, Screen::Playlists, TrackListSource::Playlist(id))
+}
+
+/// Enter the Tracks screen from `origin`, loading `source` unless it is the
+/// still-fresh current source (re-opening the same playlist/album is instant).
+fn drill_into_tracks(model: &mut Model, origin: Screen, source: TrackListSource) -> Vec<Action> {
+    model.tracks_origin = origin;
     model.screen = Screen::Tracks;
+    let actions = track_tab_load(model, source, false);
     model.reset_selection();
-    vec![Action::LoadPlaylistTracks(id)]
+    actions
 }
 
 /// Play the selected track from the playlist/library track list, queueing the
@@ -528,10 +720,7 @@ fn activate_album(model: &mut Model, index: usize) -> Vec<Action> {
         return Vec::new();
     };
     let id = album.id.clone();
-    model.track_list_source = Some(TrackListSource::Album(id.clone()));
-    model.screen = Screen::Tracks;
-    model.reset_selection();
-    vec![Action::LoadAlbumTracks(id)]
+    drill_into_tracks(model, Screen::Library, TrackListSource::Album(id))
 }
 
 /// Drill into a playlist from the search results.
@@ -540,10 +729,7 @@ fn activate_search_playlist(model: &mut Model, index: usize) -> Vec<Action> {
         return Vec::new();
     };
     let id = playlist.id.clone();
-    model.track_list_source = Some(TrackListSource::Playlist(id.clone()));
-    model.screen = Screen::Tracks;
-    model.reset_selection();
-    vec![Action::LoadPlaylistTracks(id)]
+    drill_into_tracks(model, Screen::Search, TrackListSource::Playlist(id))
 }
 
 /// Drill into an album from the search results.
@@ -552,10 +738,7 @@ fn activate_search_album(model: &mut Model, index: usize) -> Vec<Action> {
         return Vec::new();
     };
     let id = album.id.clone();
-    model.track_list_source = Some(TrackListSource::Album(id.clone()));
-    model.screen = Screen::Tracks;
-    model.reset_selection();
-    vec![Action::LoadAlbumTracks(id)]
+    drill_into_tracks(model, Screen::Search, TrackListSource::Album(id))
 }
 
 /// Advance playback to the next queue entry, updating the expected track before
@@ -948,19 +1131,10 @@ fn active_track_list(model: &Model) -> &[crate::model::TrackItem] {
     }
 }
 
-/// Answer an IPC now-playing request from the cached snapshot.
-fn now_playing_requested(
-    model: &Model,
-    reply: tokio::sync::oneshot::Sender<NowPlayingPayload>,
-) -> Vec<Action> {
-    let _ = reply.send(NowPlayingPayload::from(&model.now_playing));
-    Vec::new()
-}
-
 #[cfg(test)]
 mod tests {
-    //! Key-routing and IPC-reply behavior. These live in-crate because they use
-    //! `crossterm`/`tokio` types that an integration test crate cannot reach.
+    //! Key-routing behavior. These live in-crate because they use `crossterm`
+    //! types that an integration test crate cannot reach.
 
     use crate::config::Keybindings;
     use crate::message::{Action, Message};
@@ -1039,12 +1213,20 @@ mod tests {
     }
 
     #[test]
-    fn esc_in_tracks_returns_to_playlists() {
+    fn esc_in_tracks_returns_to_the_drill_in_origin() {
         let mut model = Model::new();
         model.screen = Screen::Tracks;
+        model.tracks_origin = Screen::Playlists;
         let actions = update(&mut model, key(KeyCode::Esc));
         assert_eq!(model.screen, Screen::Playlists);
         assert_eq!(actions, vec![Action::LoadPlaylists]);
+
+        // Drilled in from Search: Esc returns there without any load.
+        model.screen = Screen::Tracks;
+        model.tracks_origin = Screen::Search;
+        let actions = update(&mut model, key(KeyCode::Esc));
+        assert_eq!(model.screen, Screen::Search);
+        assert!(actions.is_empty());
     }
 
     #[test]
@@ -1121,19 +1303,7 @@ mod tests {
     }
 
     #[test]
-    fn now_playing_request_replies_with_snapshot() {
-        let mut model = Model::new();
-        model.now_playing.track = Some("Song".to_owned());
-        model.now_playing.state = PlaybackState::Playing;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        update(&mut model, Message::NowPlayingRequested(tx));
-        let payload = rx.blocking_recv().expect("reply should be sent");
-        assert_eq!(payload.track.as_deref(), Some("Song"));
-        assert_eq!(payload.state, PlaybackState::Playing);
-    }
-
-    #[test]
-    fn tab_cycles_library_tabs_and_loads_each() {
+    fn tab_cycles_library_tabs_and_loads_each_once() {
         use crate::model::TimeRange;
         use crate::state::LibraryTab;
         let mut model = Model::new();
@@ -1151,9 +1321,78 @@ mod tests {
         assert_eq!(model.library_tab, LibraryTab::RecentlyPlayed);
         assert_eq!(actions, vec![Action::LoadRecentlyPlayed]);
 
+        // Cycling back to a tab whose request is still in flight does NOT
+        // refire the load: the freshness cache dedups it.
         let actions = update(&mut model, key(KeyCode::BackTab));
         assert_eq!(model.library_tab, LibraryTab::TopArtists);
-        assert_eq!(actions, vec![Action::LoadTopArtists(TimeRange::MediumTerm)]);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn refresh_key_forces_a_reload_of_fresh_data() {
+        use crate::state::LoadPhase;
+        use std::time::Instant;
+        let mut model = Model::new();
+        model.screen = Screen::Playlists;
+        model.playlists_phase = LoadPhase::Loaded(Instant::now());
+
+        // Fresh data: re-entering the screen loads nothing…
+        assert!(update(&mut model, key(KeyCode::Char('2'))).is_empty());
+        // …but `r` bypasses the cache.
+        let actions = update(&mut model, key(KeyCode::Char('r')));
+        assert_eq!(actions, vec![Action::LoadPlaylists]);
+    }
+
+    #[test]
+    fn page_keys_jump_selection_by_a_page() {
+        let mut model = Model::new();
+        model.screen = Screen::Tracks;
+        model.tracks = (0..40)
+            .map(|i| crate::model::TrackItem {
+                id: crate::model::TrackId(format!("t{i}")),
+                title: format!("T{i}"),
+                artist: "A".to_owned(),
+                album: "L".to_owned(),
+                duration_ms: 1000,
+                album_art_images: Vec::new(),
+            })
+            .collect();
+        model.list_state.select(Some(0));
+
+        update(&mut model, key(KeyCode::PageDown));
+        assert_eq!(model.list_state.selected(), Some(15));
+        update(&mut model, key(KeyCode::PageDown));
+        assert_eq!(model.list_state.selected(), Some(30));
+        // Clamped at the end, then a page back up.
+        update(&mut model, key(KeyCode::PageDown));
+        assert_eq!(model.list_state.selected(), Some(39));
+        update(&mut model, key(KeyCode::PageUp));
+        assert_eq!(model.list_state.selected(), Some(24));
+    }
+
+    #[test]
+    fn insert_mode_cursor_keys_edit_mid_query() {
+        let mut model = Model::new();
+        update(&mut model, Message::EnterInsertMode);
+        update(&mut model, key(KeyCode::Char('a')));
+        update(&mut model, key(KeyCode::Char('b')));
+        // Move left and insert: cursor editing, not append-only.
+        update(&mut model, key(KeyCode::Left));
+        update(&mut model, key(KeyCode::Char('c')));
+        assert_eq!(model.search.query, "acb");
+        // Home + Delete removes the first character.
+        update(&mut model, key(KeyCode::Home));
+        update(&mut model, key(KeyCode::Delete));
+        assert_eq!(model.search.query, "cb");
+        // End puts the cursor back at the tail for appends.
+        update(&mut model, key(KeyCode::End));
+        update(&mut model, key(KeyCode::Char('d')));
+        assert_eq!(model.search.query, "cbd");
+        // Ctrl-U clears the whole query.
+        let ctrl_u = Message::KeyPress(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        update(&mut model, ctrl_u);
+        assert_eq!(model.search.query, "");
+        assert_eq!(model.search.cursor, 0);
     }
 
     #[test]

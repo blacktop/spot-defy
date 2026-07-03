@@ -29,6 +29,11 @@ use tokio::sync::watch;
 /// Tick interval driving search debounce and footer position interpolation.
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 
+/// If startup auth takes longer than this (e.g. an interactive browser flow),
+/// the pre-connected librespot session is rebuilt before the event loop starts
+/// rather than trusting a socket that has been idling the whole time.
+const SESSION_IDLE_REBUILD: Duration = Duration::from_secs(60);
+
 /// Fallback cover-art target when the pane is not measured yet.
 const DEFAULT_ART_EDGE_PX: u32 = 300;
 
@@ -62,6 +67,9 @@ pub struct App {
     /// Streaming credentials kept to rebuild the session after a broken pipe,
     /// reused while valid and re-minted only if a reconnect is rejected.
     streaming_token: TokenSet,
+    /// Pooled HTTP client for album-art downloads: keep-alive spares each track
+    /// change a fresh DNS + TCP + TLS handshake to the image CDN.
+    http: reqwest::Client,
 }
 
 /// What the background refresh task needs to renew the Web API access token.
@@ -96,16 +104,39 @@ pub async fn run() -> anyhow::Result<()> {
     let streaming = Box::pin(auth::obtain_streaming_token())
         .await
         .context("spotify streaming login failed")?;
-    let webapi = Box::pin(auth::obtain_webapi_token(
-        &config.client_id,
-        config.redirect_port,
-    ))
-    .await
-    .context("spotify web api login failed")?;
 
-    let mut app = Box::pin(build_app(&streaming, &webapi, &config))
-        .await
-        .context("failed to build application services")?;
+    // The librespot handshake and the Web API token exchange are independent;
+    // overlapping them cuts startup latency by the shorter of the two.
+    let auth_started = Instant::now();
+    let mut player = crate::player::librespot_player::LibrespotPlayer::new();
+    let (webapi, ()) = Box::pin(async {
+        tokio::try_join!(
+            async {
+                auth::obtain_webapi_token(&config.client_id, config.redirect_port)
+                    .await
+                    .context("spotify web api login failed")
+            },
+            async {
+                player
+                    .connect(auth::to_librespot_credentials(&streaming))
+                    .await
+                    .context("failed to connect streaming session")
+            },
+        )
+    })
+    .await?;
+
+    // A first-run browser flow can stall the join for minutes while the
+    // already-connected librespot session idles — the exact window its known
+    // broken-pipe failure comes from. Rebuild the session when auth stalled.
+    if auth_started.elapsed() > SESSION_IDLE_REBUILD {
+        player
+            .reconnect(auth::to_librespot_credentials(&streaming))
+            .await
+            .context("failed to rebuild streaming session after slow login")?;
+    }
+
+    let mut app = build_app(player, &streaming, &webapi, &config)?;
 
     // Query the terminal's image protocol BEFORE ratatui takes over the
     // terminal (the query reads stdin). `None` (or a query failure) just means
@@ -118,20 +149,14 @@ pub async fn run() -> anyhow::Result<()> {
     result
 }
 
-/// Construct the Web API and playback services from a fresh [`TokenSet`].
-///
-/// Establishes the librespot streaming session before handing control to the
-/// event loop so the first playback command does not race the handshake.
-async fn build_app(
+/// Assemble the application from an already-connected player and fresh tokens.
+fn build_app(
+    player: crate::player::librespot_player::LibrespotPlayer,
     streaming: &TokenSet,
     webapi: &TokenSet,
     config: &Config,
 ) -> anyhow::Result<App> {
     let api = crate::api::rspotify_client::RspotifyApi::new(auth::to_rspotify_token(webapi));
-    let mut player = crate::player::librespot_player::LibrespotPlayer::new();
-    Box::pin(player.connect(auth::to_librespot_credentials(streaming)))
-        .await
-        .context("failed to connect streaming session")?;
     let mut app = App::new(Box::new(api), Box::new(player), streaming.clone(), config)?;
     app.schedule_token_refresh(
         webapi.expires_at,
@@ -173,6 +198,7 @@ impl App {
             art_rx,
             art_url: None,
             streaming_token,
+            http: reqwest::Client::new(),
         })
     }
 
@@ -409,8 +435,9 @@ impl App {
         self.art_url = Some(url.clone());
         self.album_art = None;
         let tx = self.art_tx.clone();
+        let http = self.http.clone();
         tokio::spawn(async move {
-            let art = load_album_art(&picker, &url).await;
+            let art = load_album_art(&http, &picker, &url).await;
             let _ = tx.send((url, art));
         });
     }
@@ -487,8 +514,14 @@ fn album_art_edge_px(image: &AlbumArtImage) -> Option<u32> {
 
 /// Download and decode album art into a renderable protocol, returning `None`
 /// on any failure (network error, non-200, or undecodable image).
-async fn load_album_art(picker: &Picker, url: &str) -> Option<StatefulProtocol> {
-    let bytes = reqwest::get(url)
+async fn load_album_art(
+    http: &reqwest::Client,
+    picker: &Picker,
+    url: &str,
+) -> Option<StatefulProtocol> {
+    let bytes = http
+        .get(url)
+        .send()
         .await
         .ok()?
         .error_for_status()
@@ -589,25 +622,64 @@ async fn run_action(
 /// Run a multi-type search, populating every lane of a
 /// [`SearchResultset`](crate::api::SearchResultset).
 ///
-/// The four type queries run concurrently; a failure in any lane fails the
-/// whole search so the error surfaces rather than showing partial results.
+/// The four type queries run concurrently. Partial results beat none: a lane
+/// that fails comes back empty but is named in `failed_lanes` (logged, shown
+/// in the status bar, and rendered honestly by its tab), and the search only
+/// errors as a whole when every lane came back empty-handed.
 async fn search(
     api: &dyn SpotifyApi,
     query: &str,
     limit: u32,
 ) -> Result<crate::api::SearchResultset, crate::error::ApiError> {
-    let (tracks, albums, artists, playlists) = tokio::try_join!(
+    let (tracks, albums, artists, playlists) = tokio::join!(
         api.search_tracks(query, limit),
         api.search_albums(query, limit),
         api.search_artists(query, limit),
         api.search_playlists(query, limit),
-    )?;
-    Ok(crate::api::SearchResultset {
-        tracks,
-        albums,
-        artists,
-        playlists,
-    })
+    );
+    let mut failed = Failed::default();
+    let results = crate::api::SearchResultset {
+        tracks: lane(tracks, "Tracks", &mut failed),
+        albums: lane(albums, "Albums", &mut failed),
+        artists: lane(artists, "Artists", &mut failed),
+        playlists: lane(playlists, "Playlists", &mut failed),
+        failed_lanes: failed.lanes,
+    };
+    let all_empty = results.tracks.is_empty()
+        && results.albums.is_empty()
+        && results.artists.is_empty()
+        && results.playlists.is_empty();
+    match failed.first_error {
+        Some(error) if all_empty => Err(error),
+        Some(_) | None => Ok(results),
+    }
+}
+
+/// Failure bookkeeping across the four search lanes.
+#[derive(Default)]
+struct Failed {
+    lanes: Vec<&'static str>,
+    first_error: Option<crate::error::ApiError>,
+}
+
+/// Unwrap one search lane, recording a failure and substituting an empty lane
+/// so the other lanes' results still reach the user.
+fn lane<T>(
+    result: Result<Vec<T>, crate::error::ApiError>,
+    name: &'static str,
+    failed: &mut Failed,
+) -> Vec<T> {
+    match result {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(lane = name, error = %error, "search lane failed");
+            failed.lanes.push(name);
+            if failed.first_error.is_none() {
+                failed.first_error = Some(error);
+            }
+            Vec::new()
+        }
+    }
 }
 
 /// Reconnect the streaming session, re-minting streaming credentials once if

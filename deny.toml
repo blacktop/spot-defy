@@ -32,6 +32,13 @@ ignore = [
   "RUSTSEC-2026-0098",
   "RUSTSEC-2026-0099",
   "RUSTSEC-2026-0104",
+  # quick-xml 0.38 (quadratic duplicate-attribute check + unbounded namespace
+  # allocation, both DoS-class). Fixed only in quick-xml 0.41, a semver break
+  # librespot-core 0.8 has not taken. The XML quick-xml parses here comes solely
+  # from Spotify's own TLS-authenticated endpoints, not attacker-controlled
+  # input, so the DoS vectors are not reachable in practice.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
 ]
 
 [licenses]

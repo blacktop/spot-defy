@@ -8,8 +8,7 @@
 
 use crate::error::ApiError;
 use crate::model::{
-    AlbumId, AlbumItem, ArtistItem, PlaybackSnapshot, PlaylistId, PlaylistItem, TimeRange,
-    TrackItem,
+    AlbumId, AlbumItem, ArtistItem, PlaylistId, PlaylistItem, TimeRange, TrackItem,
 };
 use async_trait::async_trait;
 use secrecy::SecretString;
@@ -30,6 +29,10 @@ pub struct SearchResultset {
     pub albums: Vec<AlbumItem>,
     pub artists: Vec<ArtistItem>,
     pub playlists: Vec<PlaylistItem>,
+    /// Labels (matching [`crate::state::SearchTab::label`]) of lanes whose
+    /// query failed. Partial results still render, but a failed lane must be
+    /// distinguishable from a genuinely empty one.
+    pub failed_lanes: Vec<&'static str>,
 }
 
 /// The Spotify Web API surface used by spot-defy.
@@ -78,9 +81,6 @@ pub trait SpotifyApi: Send + Sync {
 
     /// The tracks of a single album (drilled into from the Albums tab).
     async fn album_tracks(&self, id: &AlbumId) -> Result<Vec<TrackItem>, ApiError>;
-
-    /// The current playback state, or `None` when nothing is active.
-    async fn current_playback(&self) -> Result<Option<PlaybackSnapshot>, ApiError>;
 
     /// Replace the bearer access token used for subsequent requests.
     ///

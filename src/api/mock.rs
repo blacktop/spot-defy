@@ -6,8 +6,7 @@
 use crate::api::SpotifyApi;
 use crate::error::ApiError;
 use crate::model::{
-    AlbumId, AlbumItem, ArtistItem, PlaybackSnapshot, PlaylistId, PlaylistItem, TimeRange,
-    TrackItem,
+    AlbumId, AlbumItem, ArtistItem, PlaylistId, PlaylistItem, TimeRange, TrackItem,
 };
 use async_trait::async_trait;
 use secrecy::SecretString;
@@ -19,7 +18,6 @@ pub struct MockApi {
     pub albums: Vec<AlbumItem>,
     pub artists: Vec<ArtistItem>,
     pub playlists: Vec<PlaylistItem>,
-    pub playback: Option<PlaybackSnapshot>,
 }
 
 #[async_trait]
@@ -74,10 +72,6 @@ impl SpotifyApi for MockApi {
 
     async fn album_tracks(&self, _id: &AlbumId) -> Result<Vec<TrackItem>, ApiError> {
         Ok(self.tracks.clone())
-    }
-
-    async fn current_playback(&self) -> Result<Option<PlaybackSnapshot>, ApiError> {
-        Ok(self.playback.clone())
     }
 
     async fn set_access_token(&self, _access_token: SecretString) {}
