@@ -4,8 +4,13 @@
 //! The token lives behind a tokio `Mutex` inside rspotify; this module must
 //! clone the token and drop the guard before any `.await` (clippy
 //! `await_holding_lock` is denied) — never hold the lock across an HTTP call.
-//! Model-mapping helpers tolerate absent optional fields, and only still-live
-//! endpoints are called (no recommendations / audio-features / featured).
+//!
+//! Track lists are fetched as raw JSON (through rspotify's authenticated HTTP
+//! layer) and parsed with the lenient `Raw*` models below: rspotify's typed
+//! `FullTrack` demands fields Spotify legitimately omits (a local playlist
+//! file has no `external_ids`), and one such row used to fail an entire page.
+//! Only still-live endpoints are called (no recommendations / audio-features /
+//! featured).
 
 use crate::api::{SEARCH_LIMIT_MAX, SpotifyApi};
 use crate::error::ApiError;
@@ -15,15 +20,16 @@ use crate::model::{
 };
 use async_trait::async_trait;
 use rspotify::clients::{BaseClient, OAuthClient};
-use rspotify::http::HttpError;
+use rspotify::http::{HttpError, Query};
 use rspotify::model::{
-    AlbumId as RsAlbumId, FullAlbum, FullArtist, FullTrack, LibraryId, PlayableItem,
-    PlaylistId as RsPlaylistId, SearchResult, SearchType, SimplifiedAlbum, SimplifiedArtist,
-    SimplifiedPlaylist, SimplifiedTrack, TimeRange as RsTimeRange, TrackId as RsTrackId,
+    AlbumId as RsAlbumId, FullAlbum, FullArtist, LibraryId, PlaylistId as RsPlaylistId,
+    SearchResult, SearchType, SimplifiedAlbum, SimplifiedArtist, SimplifiedPlaylist,
+    SimplifiedTrack, TimeRange as RsTimeRange, TrackId as RsTrackId,
 };
 use rspotify::prelude::Id as _;
 use rspotify::{AuthCodePkceSpotify, ClientError, Token};
 use secrecy::{ExposeSecret as _, SecretString};
+use serde::Deserialize;
 
 /// Page size for non-search library/discovery queries.
 ///
@@ -74,16 +80,157 @@ impl RspotifyApi {
     pub fn client(&self) -> &AuthCodePkceSpotify {
         &self.client
     }
+
+    /// GET `endpoint` through rspotify's authenticated HTTP layer (with the
+    /// usual 429 retry) and deserialize with one of the lenient `Raw*` models.
+    ///
+    /// `api_get` is a stable-but-doc-hidden `BaseClient` method; rspotify is
+    /// exact-pinned, so relying on it is safe until the next deliberate bump.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        params: &[(&str, &str)],
+    ) -> Result<T, ApiError> {
+        let query: Query<'_> = params.iter().copied().collect();
+        let body = self
+            .retrying(|| self.client.api_get(endpoint, &query))
+            .await?;
+        serde_json::from_str(&body)
+            .map_err(|e| ApiError::Mapping(format!("unexpected {endpoint} payload: {e}")))
+    }
+}
+
+/// Lenient track object: only the fields the UI renders, everything defaulted,
+/// so a stripped-down row (local file, relinked ghost) never fails a page.
+#[derive(Debug, Default, Deserialize)]
+struct RawTrack {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    artists: Vec<RawArtist>,
+    #[serde(default)]
+    album: RawAlbumRef,
+    #[serde(default)]
+    duration_ms: u64,
+    /// `"track"` or `"episode"`; playlists can contain both.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawArtist {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAlbumRef {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    images: Vec<RawImage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawImage {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+}
+
+/// A page of bare track objects (`/me/top/tracks`, search's `tracks.items`).
+#[derive(Debug, Default, Deserialize)]
+struct RawTrackPage {
+    #[serde(default)]
+    items: Vec<RawTrack>,
+}
+
+/// A page of wrapped track rows (`{"items": [{"track": {…}}]}`): playlist
+/// items, saved tracks, and recently played all share this shape.
+#[derive(Debug, Default, Deserialize)]
+struct RawTrackEntries {
+    #[serde(default)]
+    items: Vec<RawTrackEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTrackEntry {
+    #[serde(default)]
+    track: Option<RawTrack>,
+}
+
+/// The `tracks` lane of a search response.
+#[derive(Debug, Default, Deserialize)]
+struct RawSearchTracks {
+    #[serde(default)]
+    tracks: RawTrackPage,
+}
+
+/// Map a lenient raw track into the UI's [`TrackItem`]. Local tracks keep an
+/// empty id (still rendered, not playable) — same policy as before.
+fn lenient_track_item(track: RawTrack) -> TrackItem {
+    TrackItem {
+        id: TrackId(track.id.unwrap_or_default()),
+        title: track.name,
+        artist: track
+            .artists
+            .iter()
+            .map(|artist| artist.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        album: track.album.name,
+        duration_ms: u32::try_from(track.duration_ms).unwrap_or(u32::MAX),
+        album_art_images: track
+            .album
+            .images
+            .into_iter()
+            .map(|image| AlbumArtImage {
+                url: image.url,
+                width: image.width,
+                height: image.height,
+            })
+            .collect(),
+    }
+}
+
+/// Flatten wrapped track rows, dropping empty slots and non-track rows
+/// (episodes) the way the typed mapping used to.
+fn lenient_track_items(entries: RawTrackEntries) -> Vec<TrackItem> {
+    entries
+        .items
+        .into_iter()
+        .filter_map(|entry| entry.track)
+        .filter(|track| track.kind.as_deref() == Some("track"))
+        .map(lenient_track_item)
+        .collect()
 }
 
 #[async_trait]
 impl SpotifyApi for RspotifyApi {
     async fn search_tracks(&self, query: &str, limit: u32) -> Result<Vec<TrackItem>, ApiError> {
-        let result = self.search(query, SearchType::Track, limit).await?;
-        match result {
-            SearchResult::Tracks(page) => Ok(page.items.iter().map(map_full_track).collect()),
-            other => Err(unexpected_search_result("tracks", &other)),
-        }
+        let limit = limit.clamp(1, SEARCH_LIMIT_MAX).to_string();
+        let page: RawSearchTracks = self
+            .get_json(
+                "search",
+                &[
+                    ("q", query),
+                    ("type", "track"),
+                    ("limit", &limit),
+                    ("offset", "0"),
+                ],
+            )
+            .await?;
+        Ok(page
+            .tracks
+            .items
+            .into_iter()
+            .map(lenient_track_item)
+            .collect())
     }
 
     async fn search_albums(&self, query: &str, limit: u32) -> Result<Vec<AlbumItem>, ApiError> {
@@ -144,33 +291,37 @@ impl SpotifyApi for RspotifyApi {
     }
 
     async fn playlist_tracks(&self, id: &PlaylistId) -> Result<Vec<TrackItem>, ApiError> {
+        // Validate the id shape before splicing it into the endpoint path.
         let playlist_id = RsPlaylistId::from_id(id.0.as_str())
             .map_err(|e| ApiError::Mapping(format!("invalid playlist id {}: {e}", id.0)))?;
-        let page = self
-            .retrying(|| {
-                self.client.playlist_items_manual(
-                    playlist_id.clone(),
-                    None,
-                    None,
-                    Some(PAGE_LIMIT),
-                    Some(0),
-                )
-            })
+        let endpoint = format!("playlists/{}/tracks", playlist_id.id());
+        let limit = PAGE_LIMIT.to_string();
+        let page: RawTrackEntries = self
+            .get_json(
+                &endpoint,
+                &[
+                    ("limit", &limit),
+                    ("offset", "0"),
+                    ("additional_types", "track"),
+                ],
+            )
             .await?;
-        Ok(page.items.iter().filter_map(map_playlist_item).collect())
+        Ok(lenient_track_items(page))
     }
 
     async fn top_tracks(&self, range: TimeRange) -> Result<Vec<TrackItem>, ApiError> {
-        let page = self
-            .retrying(|| {
-                self.client.current_user_top_tracks_manual(
-                    Some(to_rs_time_range(range)),
-                    Some(PAGE_LIMIT),
-                    Some(0),
-                )
-            })
+        let limit = PAGE_LIMIT.to_string();
+        let page: RawTrackPage = self
+            .get_json(
+                "me/top/tracks",
+                &[
+                    ("time_range", time_range_param(range)),
+                    ("limit", &limit),
+                    ("offset", "0"),
+                ],
+            )
             .await?;
-        Ok(page.items.iter().map(map_full_track).collect())
+        Ok(page.items.into_iter().map(lenient_track_item).collect())
     }
 
     async fn top_artists(&self, range: TimeRange) -> Result<Vec<ArtistItem>, ApiError> {
@@ -187,31 +338,19 @@ impl SpotifyApi for RspotifyApi {
     }
 
     async fn recently_played(&self) -> Result<Vec<TrackItem>, ApiError> {
-        let page = self
-            .retrying(|| {
-                self.client
-                    .current_user_recently_played(Some(RECENTLY_PLAYED_MAX), None)
-            })
+        let limit = RECENTLY_PLAYED_MAX.to_string();
+        let page: RawTrackEntries = self
+            .get_json("me/player/recently-played", &[("limit", &limit)])
             .await?;
-        Ok(page
-            .items
-            .iter()
-            .map(|h| map_full_track(&h.track))
-            .collect())
+        Ok(lenient_track_items(page))
     }
 
     async fn saved_tracks(&self) -> Result<Vec<TrackItem>, ApiError> {
-        let page = self
-            .retrying(|| {
-                self.client
-                    .current_user_saved_tracks_manual(None, Some(PAGE_LIMIT), Some(0))
-            })
+        let limit = PAGE_LIMIT.to_string();
+        let page: RawTrackEntries = self
+            .get_json("me/tracks", &[("limit", &limit), ("offset", "0")])
             .await?;
-        Ok(page
-            .items
-            .iter()
-            .map(|s| map_full_track(&s.track))
-            .collect())
+        Ok(lenient_track_items(page))
     }
 
     async fn saved_albums(&self) -> Result<Vec<AlbumItem>, ApiError> {
@@ -358,6 +497,15 @@ fn to_rs_time_range(range: TimeRange) -> RsTimeRange {
     }
 }
 
+/// Map our [`TimeRange`] to the Web API's query-string value.
+fn time_range_param(range: TimeRange) -> &'static str {
+    match range {
+        TimeRange::ShortTerm => "short_term",
+        TimeRange::MediumTerm => "medium_term",
+        TimeRange::LongTerm => "long_term",
+    }
+}
+
 /// Join the names of `artists` into a display string (`", "`-separated).
 fn join_artists(artists: &[SimplifiedArtist]) -> String {
     artists
@@ -365,28 +513,6 @@ fn join_artists(artists: &[SimplifiedArtist]) -> String {
         .map(|a| a.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Map a [`FullTrack`] into a [`TrackItem`].
-///
-/// Local tracks lack an id; they are surfaced with an empty [`TrackId`] so the
-/// row still renders rather than being silently dropped. Duration is taken from
-/// the chrono `Duration` and clamped into `u32` milliseconds.
-fn map_full_track(track: &FullTrack) -> TrackItem {
-    let id = track
-        .id
-        .as_ref()
-        .map(|i| i.id().to_owned())
-        .unwrap_or_default();
-    let duration_ms = u32::try_from(track.duration.num_milliseconds().max(0)).unwrap_or(u32::MAX);
-    TrackItem {
-        id: TrackId(id),
-        title: track.name.clone(),
-        artist: join_artists(&track.artists),
-        album: track.album.name.clone(),
-        duration_ms,
-        album_art_images: album_art_images(&track.album.images),
-    }
 }
 
 /// Preserve Spotify's album-cover candidates so the TUI can choose the smallest
@@ -470,14 +596,6 @@ fn map_simplified_playlist(playlist: &SimplifiedPlaylist) -> PlaylistItem {
     }
 }
 
-/// Map a playlist row into a [`TrackItem`], dropping non-track and id-less rows.
-fn map_playlist_item(item: &rspotify::model::PlaylistItem) -> Option<TrackItem> {
-    match item.item.as_ref()? {
-        PlayableItem::Track(track) => Some(map_full_track(track)),
-        PlayableItem::Episode(_) | PlayableItem::Unknown(_) => None,
-    }
-}
-
 /// Build a [`ApiError`] for a search response whose payload variant did not
 /// match the requested type (defensive — Spotify echoes the requested `type`).
 fn unexpected_search_result(expected: &str, got: &SearchResult) -> ApiError {
@@ -549,14 +667,14 @@ fn classify_status(status: u16, retry_after_secs: Option<u64>) -> ApiError {
 #[cfg(test)]
 mod tests {
     use crate::api::rspotify_client::{
-        album_art_images, classify_status, join_artists, map_full_artist, map_full_track,
-        map_playlist_item, map_simplified_album, map_simplified_playlist, to_rs_time_range,
+        RawSearchTracks, RawTrackEntries, album_art_images, classify_status, join_artists,
+        lenient_track_item, lenient_track_items, map_full_artist, map_simplified_album,
+        map_simplified_playlist, time_range_param, to_rs_time_range,
     };
     use crate::error::ApiError;
     use crate::model::TimeRange;
     use rspotify::model::{
-        FullArtist, FullTrack, PlaylistItem as RsPlaylistItem, SimplifiedAlbum, SimplifiedArtist,
-        SimplifiedPlaylist, TimeRange as RsTimeRange,
+        FullArtist, SimplifiedAlbum, SimplifiedArtist, SimplifiedPlaylist, TimeRange as RsTimeRange,
     };
 
     fn full_track_json() -> serde_json::Value {
@@ -589,14 +707,29 @@ mod tests {
         })
     }
 
+    /// A local playlist file the way Spotify actually returns it: no
+    /// `external_ids`, no id, barely any album metadata. This exact shape
+    /// used to fail whole pages under rspotify's strict `FullTrack`.
+    fn local_track_json() -> serde_json::Value {
+        serde_json::json!({
+            "album": {"album_type": null, "artists": [], "external_urls": {},
+                "href": null, "id": null, "images": [], "name": "",
+                "release_date": null, "type": "album"},
+            "artists": [{"external_urls": {}, "href": null, "id": null,
+                "name": "Basement Tape", "type": "artist"}],
+            "disc_number": 0, "duration_ms": 187_000, "explicit": false,
+            "external_urls": {}, "href": null, "id": null, "is_local": true,
+            "name": "Old Demo", "track_number": 0, "type": "track"
+        })
+    }
+
     fn parse<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
         serde_json::from_value(v).expect("sample json must deserialize")
     }
 
     #[test]
-    fn maps_full_track_fields() {
-        let track: FullTrack = parse(full_track_json());
-        let item = map_full_track(&track);
+    fn lenient_track_maps_all_rendered_fields() {
+        let item = lenient_track_item(parse(full_track_json()));
         assert_eq!(item.id.0, "06AKEBrKUckW0KREUWRnvT");
         assert_eq!(item.title, "Feel This Moment");
         assert_eq!(item.artist, "Pitbull, Christina Aguilera");
@@ -611,14 +744,50 @@ mod tests {
     }
 
     #[test]
-    fn maps_local_track_without_id_to_empty_id() {
-        let mut json = full_track_json();
-        json["id"] = serde_json::Value::Null;
-        json["is_local"] = serde_json::Value::Bool(true);
-        let track: FullTrack = parse(json);
-        let item = map_full_track(&track);
-        assert_eq!(item.id.0, "");
+    fn playlist_page_with_local_track_missing_external_ids_still_parses() {
+        // Regression: one local file (no `external_ids`) must not fail the
+        // page — the real track and the local row both map, episodes drop.
+        let page: RawTrackEntries = parse(serde_json::json!({
+            "items": [
+                {"track": full_track_json()},
+                {"track": local_track_json()},
+                {"track": {"type": "episode", "name": "Some Podcast",
+                    "duration_ms": 100, "external_urls": {}}},
+                {"track": null}
+            ],
+            "next": null
+        }));
+
+        let items = lenient_track_items(page);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].title, "Feel This Moment");
+        assert_eq!(items[1].title, "Old Demo");
+        assert_eq!(items[1].id.0, "", "local files keep an empty id");
+        assert_eq!(items[1].artist, "Basement Tape");
+    }
+
+    #[test]
+    fn search_tracks_page_parses_leniently() {
+        let page: RawSearchTracks = parse(serde_json::json!({
+            "tracks": {"items": [full_track_json()], "total": 1}
+        }));
+        assert_eq!(page.tracks.items.len(), 1);
+        let item = lenient_track_item(
+            page.tracks
+                .items
+                .into_iter()
+                .next()
+                .expect("one search row"),
+        );
         assert_eq!(item.title, "Feel This Moment");
+    }
+
+    #[test]
+    fn time_range_param_matches_web_api_values() {
+        assert_eq!(time_range_param(TimeRange::ShortTerm), "short_term");
+        assert_eq!(time_range_param(TimeRange::MediumTerm), "medium_term");
+        assert_eq!(time_range_param(TimeRange::LongTerm), "long_term");
     }
 
     #[test]
@@ -715,22 +884,6 @@ mod tests {
             "tracks": {"href": "h", "total": 3}, "items": {"href": "h", "total": 3}
         }));
         assert_eq!(map_simplified_playlist(&playlist).owner, "user-123");
-    }
-
-    #[test]
-    fn maps_playlist_track_item_and_drops_episode() {
-        let track_item: RsPlaylistItem = parse(serde_json::json!({
-            "added_at": "2020-01-01T00:00:00Z", "added_by": null, "is_local": false,
-            "track": full_track_json(), "item": full_track_json()
-        }));
-        let mapped = map_playlist_item(&track_item).expect("track item maps");
-        assert_eq!(mapped.title, "Feel This Moment");
-
-        let empty: RsPlaylistItem = parse(serde_json::json!({
-            "added_at": null, "added_by": null, "is_local": false,
-            "track": null, "item": null
-        }));
-        assert!(map_playlist_item(&empty).is_none());
     }
 
     #[test]
