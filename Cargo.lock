@@ -3848,6 +3848,7 @@ dependencies = [
  "librespot-core",
  "librespot-oauth",
  "librespot-playback",
+ "rand 0.9.4",
  "ratatui",
  "ratatui-image",
  "reqwest",

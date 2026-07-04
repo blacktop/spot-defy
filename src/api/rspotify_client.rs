@@ -17,9 +17,9 @@ use async_trait::async_trait;
 use rspotify::clients::{BaseClient, OAuthClient};
 use rspotify::http::HttpError;
 use rspotify::model::{
-    AlbumId as RsAlbumId, FullAlbum, FullArtist, FullTrack, PlayableItem,
+    AlbumId as RsAlbumId, FullAlbum, FullArtist, FullTrack, LibraryId, PlayableItem,
     PlaylistId as RsPlaylistId, SearchResult, SearchType, SimplifiedAlbum, SimplifiedArtist,
-    SimplifiedPlaylist, SimplifiedTrack, TimeRange as RsTimeRange,
+    SimplifiedPlaylist, SimplifiedTrack, TimeRange as RsTimeRange, TrackId as RsTrackId,
 };
 use rspotify::prelude::Id as _;
 use rspotify::{AuthCodePkceSpotify, ClientError, Token};
@@ -251,6 +251,35 @@ impl SpotifyApi for RspotifyApi {
             .collect())
     }
 
+    async fn is_track_saved(&self, id: &TrackId) -> Result<bool, ApiError> {
+        let track_id = rs_track_id(id)?;
+        let contained = self
+            .retrying(|| {
+                self.client
+                    .library_contains([LibraryId::Track(track_id.clone())])
+            })
+            .await?;
+        Ok(contained.first().copied().unwrap_or(false))
+    }
+
+    async fn save_track(&self, id: &TrackId) -> Result<(), ApiError> {
+        let track_id = rs_track_id(id)?;
+        self.retrying(|| {
+            self.client
+                .library_add([LibraryId::Track(track_id.clone())])
+        })
+        .await
+    }
+
+    async fn remove_saved_track(&self, id: &TrackId) -> Result<(), ApiError> {
+        let track_id = rs_track_id(id)?;
+        self.retrying(|| {
+            self.client
+                .library_remove([LibraryId::Track(track_id.clone())])
+        })
+        .await
+    }
+
     async fn set_access_token(&self, access_token: SecretString) {
         let token_lock = self.client.get_token();
         let Ok(mut guard) = token_lock.lock().await else {
@@ -312,6 +341,12 @@ impl RspotifyApi {
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         }
     }
+}
+
+/// Parse an app [`TrackId`] into rspotify's validated track id type.
+fn rs_track_id(id: &TrackId) -> Result<RsTrackId<'static>, ApiError> {
+    RsTrackId::from_id(id.0.clone())
+        .map_err(|e| ApiError::Mapping(format!("invalid track id {}: {e}", id.0)))
 }
 
 /// Map our [`TimeRange`] to rspotify's enum.

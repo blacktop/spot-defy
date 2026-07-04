@@ -251,16 +251,20 @@ fn toggle_play_pause_depends_on_state() {
 }
 
 #[test]
-fn next_prev_messages_emit_actions() {
+fn next_prev_with_no_queue_are_noops() {
     let mut model = Model::new();
-    assert_eq!(
-        update(&mut model, Message::NextTrack),
-        vec![Action::PlayerNext]
-    );
-    assert_eq!(
-        update(&mut model, Message::PrevTrack),
-        vec![Action::PlayerPrev]
-    );
+    assert!(update(&mut model, Message::NextTrack).is_empty());
+    assert!(update(&mut model, Message::PrevTrack).is_empty());
+}
+
+#[test]
+fn next_after_stop_restarts_the_loaded_queue() {
+    let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = None; // stopped, queue still loaded
+    let actions = update(&mut model, Message::NextTrack);
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(0))));
+    assert_eq!(model.playback_queue_cursor, Some(0));
 }
 
 #[test]
@@ -278,7 +282,7 @@ fn manual_next_sets_expected_track_before_player_events() {
 
     let actions = update(&mut model, Message::NextTrack);
     assert_loading_actions(&actions, "Next", &next.album_art_images);
-    assert!(matches!(actions[2], Action::PlayerNext));
+    assert!(matches!(actions[2], Action::PlayerPlayIndex(1)));
     assert_now_playing_identity(&model, "t2");
     assert_eq!(model.playback_queue_cursor, Some(1));
 
@@ -298,7 +302,7 @@ fn manual_next_ignores_stale_position_update_while_loading_next_track() {
 
     let actions = update(&mut model, Message::NextTrack);
 
-    assert!(matches!(actions[2], Action::PlayerNext));
+    assert!(matches!(actions[2], Action::PlayerPlayIndex(1)));
     assert_eq!(model.now_playing.track.as_deref(), Some("Next"));
     assert_eq!(model.now_playing.state, PlaybackState::Loading);
     assert_eq!(model.now_playing.position_ms, 0);
@@ -329,7 +333,7 @@ fn manual_previous_sets_expected_track_before_player_events() {
 
     let actions = update(&mut model, Message::PrevTrack);
     assert_loading_actions(&actions, "Previous", &previous.album_art_images);
-    assert!(matches!(actions[2], Action::PlayerPrev));
+    assert!(matches!(actions[2], Action::PlayerPlayIndex(0)));
     assert_now_playing_identity(&model, "t1");
     assert_eq!(model.playback_queue_cursor, Some(0));
 }
@@ -408,17 +412,75 @@ fn playback_loading_event_fills_now_playing() {
 #[test]
 fn end_of_track_advances_queue() {
     let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = Some(0);
     set_current(&mut model, "t1");
     let event = PlaybackEvent::EndOfTrack {
         track: TrackId("t1".to_owned()),
     };
     let actions = update(&mut model, Message::PlaybackEvent(event));
-    assert_eq!(actions, vec![Action::PlayerNext]);
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(1))));
+    assert_eq!(model.playback_queue_cursor, Some(1));
+}
+
+#[test]
+fn end_of_track_with_repeat_one_replays_the_same_track() {
+    use spot_defy::state::RepeatMode;
+    let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = Some(0);
+    model.repeat = RepeatMode::One;
+    set_current(&mut model, "t1");
+    let event = PlaybackEvent::EndOfTrack {
+        track: TrackId("t1".to_owned()),
+    };
+    let actions = update(&mut model, Message::PlaybackEvent(event));
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(0))));
+    assert_eq!(model.playback_queue_cursor, Some(0));
+}
+
+#[test]
+fn end_of_queue_wraps_with_repeat_all_and_stops_with_repeat_off() {
+    use spot_defy::state::RepeatMode;
+    let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = Some(1);
+    set_current(&mut model, "t2");
+    let end = || {
+        Message::PlaybackEvent(PlaybackEvent::EndOfTrack {
+            track: TrackId("t2".to_owned()),
+        })
+    };
+
+    model.repeat = RepeatMode::All;
+    let actions = update(&mut model, end());
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(0))));
+
+    // Reset to the queue end with repeat off: the queue stops.
+    model.playback_queue_cursor = Some(1);
+    set_current(&mut model, "t2");
+    model.repeat = RepeatMode::Off;
+    let actions = update(&mut model, end());
+    assert_eq!(actions, vec![Action::PlayerStop]);
+}
+
+#[test]
+fn manual_next_in_repeat_one_still_advances() {
+    use spot_defy::state::RepeatMode;
+    let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = Some(0);
+    model.repeat = RepeatMode::One;
+    set_current(&mut model, "t1");
+    let actions = update(&mut model, Message::NextTrack);
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(1))));
 }
 
 #[test]
 fn preload_hint_prefetches_next_queue_item() {
     let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = Some(0);
     let current = TrackId("t1".to_owned());
     model.now_playing_track = Some(current.clone());
     let event = PlaybackEvent::PreloadNext {
@@ -427,19 +489,43 @@ fn preload_hint_prefetches_next_queue_item() {
 
     let actions = update(&mut model, Message::PlaybackEvent(event));
 
-    assert_eq!(actions, vec![Action::PlayerPreloadNext { current }]);
+    assert_eq!(
+        actions,
+        vec![Action::PlayerPreload(TrackId("t2".to_owned()))]
+    );
+}
+
+#[test]
+fn preload_hint_respects_repeat_one() {
+    use spot_defy::state::RepeatMode;
+    let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = Some(0);
+    model.repeat = RepeatMode::One;
+    let current = TrackId("t1".to_owned());
+    model.now_playing_track = Some(current.clone());
+
+    let actions = update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::PreloadNext { track: current }),
+    );
+
+    // Repeat-one replays the already-loaded track: nothing new to preload.
+    assert!(actions.is_empty());
 }
 
 #[test]
 fn unavailable_event_skips_to_next_with_status() {
     let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B")];
+    model.playback_queue_cursor = Some(0);
     set_current(&mut model, "t1");
     let event = PlaybackEvent::Unavailable {
         track: TrackId("t1".to_owned()),
     };
     let actions = update(&mut model, Message::PlaybackEvent(event));
     // An unavailable track is skipped, not treated as a Premium failure.
-    assert_eq!(actions, vec![Action::PlayerNext]);
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(1))));
     assert!(
         model
             .status
@@ -458,8 +544,9 @@ fn repeated_unavailable_triggers_reconnect_not_endless_skip() {
             track: TrackId("t".to_owned()),
         })
     };
-    // First failure could be a single region-locked track: skip it.
-    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    // First failure could be a single region-locked track: skip it (with no
+    // queue loaded the skip itself is a no-op, but the streak is recorded).
+    assert!(update(&mut model, unavailable()).is_empty());
     // A second failure in a row means the session is dead: reconnect instead of
     // skipping through the whole queue.
     assert_eq!(
@@ -467,7 +554,7 @@ fn repeated_unavailable_triggers_reconnect_not_endless_skip() {
         vec![Action::PlayerReconnect]
     );
     // Further failures while a reconnect is in flight skip without re-triggering.
-    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    assert!(!update(&mut model, unavailable()).contains(&Action::PlayerReconnect));
 }
 
 #[test]
@@ -481,7 +568,8 @@ fn successful_play_resets_the_unavailable_streak() {
             track: TrackId("t".to_owned()),
         })
     };
-    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    let actions = update(&mut model, unavailable());
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(1))));
     assert_eq!(model.now_playing_track, Some(TrackId("ok".to_owned())));
     update(
         &mut model,
@@ -492,7 +580,12 @@ fn successful_play_resets_the_unavailable_streak() {
     );
     // After a track plays, the next failure starts over at a skip, not reconnect.
     set_current(&mut model, "t");
-    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    let actions = update(&mut model, unavailable());
+    assert!(!actions.contains(&Action::PlayerReconnect));
+    assert_eq!(
+        model.playback_health,
+        spot_defy::state::PlaybackHealth::Skipping(1)
+    );
 }
 
 #[test]
@@ -517,14 +610,14 @@ fn unavailable_after_reconnect_is_bounded_then_stops() {
         })
     };
     // Drive into the post-reconnect state.
-    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    assert!(!update(&mut model, unavailable()).contains(&Action::PlayerReconnect));
     assert_eq!(
         update(&mut model, unavailable()),
         vec![Action::PlayerReconnect]
     );
     // Post-reconnect failures skip a bounded number, then STOP rather than
     // skip-storming the rest of the queue track-by-track.
-    assert_eq!(update(&mut model, unavailable()), vec![Action::PlayerNext]);
+    assert!(!update(&mut model, unavailable()).contains(&Action::PlayerReconnect));
     let stopped = update(&mut model, unavailable());
     assert!(stopped.is_empty(), "the storm must stop, not keep skipping");
     assert_eq!(model.now_playing.state, PlaybackState::Stopped);
@@ -615,7 +708,7 @@ fn playing_event_for_preloaded_next_updates_metadata_art_and_highlight() {
         }),
     );
     assert_loading_actions(&end_actions, "Next", &next.album_art_images);
-    assert!(matches!(end_actions[2], Action::PlayerNext));
+    assert!(matches!(end_actions[2], Action::PlayerPlayIndex(1)));
     assert_eq!(model.now_playing_track, Some(TrackId("t2".to_owned())));
 
     let actions = update(
@@ -1082,4 +1175,252 @@ fn track_response_landing_after_esc_is_kept_for_reentry() {
     let actions = update(&mut model, Message::ActivateSelection);
     assert!(actions.is_empty());
     assert_eq!(model.tracks.len(), 1);
+}
+
+#[test]
+fn shuffle_toggle_permutes_and_restores_the_queue() {
+    let mut model = Model::new();
+    let original: Vec<_> = (0..8)
+        .map(|i| track(&format!("t{i}"), &format!("T{i}")))
+        .collect();
+    model.playback_queue = original.clone();
+    model.playback_queue_cursor = Some(3);
+    set_current(&mut model, "t3");
+
+    let actions = update(&mut model, Message::ToggleShuffle);
+    assert!(model.shuffle);
+    // Same tracks, cursor still pointing at the playing track.
+    assert_eq!(model.playback_queue.len(), original.len());
+    for item in &original {
+        assert!(model.playback_queue.contains(item));
+    }
+    let cursor = model.playback_queue_cursor.expect("cursor kept");
+    assert_eq!(model.playback_queue[cursor].id.0, "t3");
+    // The player's mirrored queue is synced to the new order.
+    assert!(matches!(
+        &actions[..],
+        [Action::PlayerSetQueue { queue, cursor: Some(c) }]
+            if queue.len() == original.len() && queue[*c].0 == "t3"
+    ));
+
+    // Toggling off restores the original order exactly.
+    update(&mut model, Message::ToggleShuffle);
+    assert!(!model.shuffle);
+    assert_eq!(model.playback_queue, original);
+    assert_eq!(model.playback_queue_cursor, Some(3));
+}
+
+#[test]
+fn shuffle_with_no_queue_is_a_noop_with_status() {
+    let mut model = Model::new();
+    let actions = update(&mut model, Message::ToggleShuffle);
+    assert!(actions.is_empty());
+    assert!(!model.shuffle);
+    assert!(model.status.is_some());
+}
+
+#[test]
+fn toggle_like_targets_the_now_playing_track() {
+    let mut model = Model::new();
+    set_current(&mut model, "t1");
+    let actions = update(&mut model, Message::ToggleLike);
+    assert_eq!(actions, vec![Action::ToggleSaved(TrackId("t1".to_owned()))]);
+
+    // Without a playing track it explains itself instead of failing silently.
+    let mut idle = Model::new();
+    assert!(update(&mut idle, Message::ToggleLike).is_empty());
+    assert!(idle.status.is_some());
+}
+
+#[test]
+fn saved_toggled_invalidates_the_saved_tab_cache() {
+    use spot_defy::state::LoadPhase;
+    use std::time::Instant;
+    let mut model = Model::new();
+    model.track_list_source = Some(TrackListSource::SavedTracks);
+    model.tracks_phase = LoadPhase::Loaded(Instant::now());
+
+    update(&mut model, Message::SavedToggled(Ok(true)));
+
+    assert!(model.status.expect("status set").contains("saved"));
+    assert_eq!(
+        model.tracks_phase,
+        LoadPhase::Idle,
+        "the Saved tab must refetch after a like/unlike"
+    );
+}
+
+#[test]
+fn queue_selected_appends_and_syncs_the_player() {
+    let mut model = Model::new();
+    model.screen = Screen::Tracks;
+    model.tracks = vec![track("t1", "A"), track("t9", "New")];
+    model.playback_queue = vec![track("t1", "A")];
+    model.playback_queue_cursor = Some(0);
+    model.list_state.select(Some(1));
+
+    let actions = update(&mut model, Message::QueueSelected);
+
+    assert_eq!(model.playback_queue.len(), 2);
+    assert_eq!(model.playback_queue[1].id.0, "t9");
+    assert!(matches!(
+        &actions[..],
+        [Action::PlayerSetQueue { queue, .. }] if queue.len() == 2
+    ));
+
+    // With nothing playing, queueing explains itself and does nothing.
+    let mut idle = Model::new();
+    idle.screen = Screen::Tracks;
+    idle.tracks = vec![track("t1", "A")];
+    idle.list_state.select(Some(0));
+    assert!(update(&mut idle, Message::QueueSelected).is_empty());
+    assert!(idle.status.is_some());
+}
+
+#[test]
+fn remove_queued_adjusts_cursor_and_protects_the_playing_row() {
+    let mut model = Model::new();
+    model.screen = Screen::Queue;
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B"), track("t3", "C")];
+    model.playback_queue_cursor = Some(1);
+    set_current(&mut model, "t2");
+
+    // Removing a row before the cursor shifts the cursor left.
+    model.list_state.select(Some(0));
+    let actions = update(&mut model, Message::RemoveQueued);
+    assert_eq!(model.playback_queue.len(), 2);
+    assert_eq!(model.playback_queue_cursor, Some(0));
+    assert!(matches!(&actions[..], [Action::PlayerSetQueue { .. }]));
+
+    // The playing row itself refuses to be removed.
+    model.list_state.select(Some(0));
+    assert!(update(&mut model, Message::RemoveQueued).is_empty());
+    assert_eq!(model.playback_queue.len(), 2);
+}
+
+#[test]
+fn queue_screen_enter_jumps_to_the_selected_entry() {
+    let mut model = Model::new();
+    model.screen = Screen::Queue;
+    model.playback_queue = vec![track("t1", "A"), track("t2", "B"), track("t3", "C")];
+    model.playback_queue_cursor = Some(0);
+    set_current(&mut model, "t1");
+    model.list_state.select(Some(2));
+
+    let actions = update(&mut model, Message::ActivateSelection);
+
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(2))));
+    assert_eq!(model.playback_queue_cursor, Some(2));
+    assert_eq!(model.now_playing_track, Some(TrackId("t3".to_owned())));
+}
+
+#[test]
+fn duplicate_track_ids_keep_the_explicit_cursor_instance() {
+    // Queue [A, B, A]: jumping to the SECOND A must not snap the cursor back
+    // to the first A (that caused an infinite A→B loop with repeat off).
+    let mut model = Model::new();
+    model.screen = Screen::Queue;
+    model.playback_queue = vec![track("a", "A"), track("b", "B"), track("a", "A")];
+    model.playback_queue_cursor = Some(0);
+    set_current(&mut model, "a");
+    model.list_state.select(Some(2));
+
+    let actions = update(&mut model, Message::ActivateSelection);
+    assert!(matches!(actions.last(), Some(Action::PlayerPlayIndex(2))));
+    assert_eq!(
+        model.playback_queue_cursor,
+        Some(2),
+        "the cursor must stay on the jumped-to instance"
+    );
+
+    // The second A ending must end the queue (repeat off), not replay B.
+    let actions = update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::EndOfTrack {
+            track: TrackId("a".to_owned()),
+        }),
+    );
+    assert_eq!(actions, vec![Action::PlayerStop]);
+}
+
+#[test]
+fn shuffle_can_always_be_turned_off() {
+    // Shuffle on with a queue, then the queue empties (e.g. removed row by
+    // row after playback stopped): 's' must still disable shuffle.
+    let mut model = Model::new();
+    model.playback_queue = vec![track("t1", "A")];
+    update(&mut model, Message::ToggleShuffle);
+    assert!(model.shuffle);
+    model.playback_queue.clear();
+    model.shuffle_order = Some(Vec::new());
+
+    update(&mut model, Message::ToggleShuffle);
+    assert!(!model.shuffle, "shuffle must never get stuck on");
+}
+
+#[test]
+fn unshuffle_restores_exact_order_after_shuffled_edits() {
+    // Craft a known permutation: shuffled [C, B, A] came from original
+    // [A, B, C] via order [2, 1, 0]. Removing the shuffled row 0 (original C)
+    // then unshuffling must yield [A, B] — instance-exact, not id-guessed.
+    let mut model = Model::new();
+    model.screen = Screen::Queue;
+    model.playback_queue = vec![track("c", "C"), track("b", "B"), track("a", "A")];
+    model.shuffle = true;
+    model.shuffle_order = Some(vec![2, 1, 0]);
+    model.playback_queue_cursor = Some(1); // playing B
+    set_current(&mut model, "b");
+
+    model.list_state.select(Some(0));
+    update(&mut model, Message::RemoveQueued);
+    assert_eq!(model.playback_queue.len(), 2);
+
+    update(&mut model, Message::ToggleShuffle);
+    assert!(!model.shuffle);
+    let ids: Vec<&str> = model
+        .playback_queue
+        .iter()
+        .map(|t| t.id.0.as_str())
+        .collect();
+    assert_eq!(ids, vec!["a", "b"], "original order minus the removed row");
+    // The cursor followed the playing instance to its original position.
+    assert_eq!(model.playback_queue_cursor, Some(1));
+}
+
+#[test]
+fn unavailable_single_track_repeat_all_stops_without_reconnect() {
+    use spot_defy::state::{PlaybackHealth, RepeatMode};
+    let mut model = Model::new();
+    model.playback_queue = vec![track("dead", "Dead")];
+    model.playback_queue_cursor = Some(0);
+    model.repeat = RepeatMode::All;
+    set_current(&mut model, "dead");
+
+    let actions = update(
+        &mut model,
+        Message::PlaybackEvent(PlaybackEvent::Unavailable {
+            track: TrackId("dead".to_owned()),
+        }),
+    );
+
+    // Wrapping the skip back onto the same dead track must stop playback, not
+    // replay it or escalate into a full session reconnect.
+    assert_eq!(actions, vec![Action::PlayerStop]);
+    assert_eq!(model.playback_health, PlaybackHealth::Healthy);
+    assert_eq!(model.now_playing.state, PlaybackState::Stopped);
+}
+
+#[test]
+fn like_toggle_is_single_flight() {
+    let mut model = Model::new();
+    set_current(&mut model, "t1");
+    let first = update(&mut model, Message::ToggleLike);
+    assert_eq!(first, vec![Action::ToggleSaved(TrackId("t1".to_owned()))]);
+    // A second press while the round trip is in flight must not race it.
+    let second = update(&mut model, Message::ToggleLike);
+    assert!(second.is_empty());
+    // The reply re-arms the toggle.
+    update(&mut model, Message::SavedToggled(Ok(true)));
+    let third = update(&mut model, Message::ToggleLike);
+    assert_eq!(third, vec![Action::ToggleSaved(TrackId("t1".to_owned()))]);
 }

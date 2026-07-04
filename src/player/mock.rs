@@ -84,15 +84,19 @@ impl Playback for MockPlayer {
         Ok(())
     }
 
-    fn next(&self) -> Result<(), PlayerError> {
+    fn set_queue(&self, _tracks: &[TrackId], _cursor: Option<usize>) -> Result<(), PlayerError> {
         Ok(())
     }
 
-    fn preload_next(&self, _current: &TrackId) -> Result<(), PlayerError> {
+    fn play_at(&self, _index: usize) -> Result<(), PlayerError> {
         Ok(())
     }
 
-    fn previous(&self) -> Result<(), PlayerError> {
+    fn stop(&self) -> Result<(), PlayerError> {
+        Ok(())
+    }
+
+    fn preload(&self, _track: &TrackId) -> Result<(), PlayerError> {
         Ok(())
     }
 

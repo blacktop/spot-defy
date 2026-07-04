@@ -350,9 +350,12 @@ impl App {
 
     /// Dispatch a single [`Action`].
     ///
-    /// [`Action::PublishNowPlaying`] and [`Action::LoadAlbumArt`] are handled
-    /// inline (IPC publish and art loading); every other action runs in a
-    /// spawned task that returns a follow-up [`Message`].
+    /// Player control commands are synchronous, non-blocking enqueues, so they
+    /// run inline — this preserves the order the reducer emitted them in
+    /// (`PlayerSetQueue` must land before a following `PlayerPlayIndex`, which
+    /// per-action `tokio::spawn` cannot guarantee). IPC publish, art loading,
+    /// and the reconnect are also handled inline; API loads run as spawned
+    /// tasks that send a follow-up [`Message`].
     fn dispatch_action(&mut self, action: Action) {
         match action {
             Action::PublishNowPlaying(snapshot) => {
@@ -367,17 +370,68 @@ impl App {
                 self.spawn_reconnect();
                 return;
             }
-            _ => {}
+            Action::PlayerLoad { queue, index } => {
+                self.player_command(self.player.load_queue(&queue, index, true));
+                return;
+            }
+            Action::PlayerSetQueue { queue, cursor } => {
+                self.player_command(self.player.set_queue(&queue, cursor));
+                return;
+            }
+            Action::PlayerPlay => {
+                self.player_command(self.player.play());
+                return;
+            }
+            Action::PlayerPause => {
+                self.player_command(self.player.pause());
+                return;
+            }
+            Action::PlayerPlayIndex(index) => {
+                self.player_command(self.player.play_at(index));
+                return;
+            }
+            Action::PlayerStop => {
+                self.player_command(self.player.stop());
+                return;
+            }
+            Action::PlayerPreload(track) => {
+                self.player_command(self.player.preload(&track));
+                return;
+            }
+            Action::PlayerSeek(position_ms) => {
+                self.player_command(self.player.seek(position_ms));
+                return;
+            }
+            Action::PlayerSetVolume(volume) => {
+                self.player_command(self.player.set_volume(volume));
+                return;
+            }
+            Action::Search { .. }
+            | Action::LoadPlaylists
+            | Action::LoadPlaylistTracks(_)
+            | Action::LoadTopTracks(_)
+            | Action::LoadTopArtists(_)
+            | Action::LoadRecentlyPlayed
+            | Action::LoadSavedTracks
+            | Action::LoadSavedAlbums
+            | Action::LoadAlbumTracks(_)
+            | Action::ToggleSaved(_) => {}
         }
         let api = Arc::clone(&self.api);
-        let player = Arc::clone(&self.player);
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let future = Box::pin(run_action(api, player, action));
+            let future = Box::pin(run_action(api, action));
             if let Some(message) = future.await {
                 let _ = tx.send(message);
             }
         });
+    }
+
+    /// Surface a failed inline player command as a status message.
+    fn player_command(&self, result: Result<(), crate::error::PlayerError>) {
+        if let Err(err) = result {
+            let _ = self.tx.send(Message::Error(err.to_string()));
+        }
     }
 
     /// Rebuild the dropped streaming session off the UI thread, reusing the
@@ -549,16 +603,12 @@ fn message_from_event(
     }
 }
 
-/// Execute one [`Action`] against the services, producing a follow-up message.
+/// Execute one Web-API [`Action`], producing its follow-up message.
 ///
-/// Returns `None` for fire-and-forget commands that need no reply. API errors
-/// are wrapped into the corresponding `*Loaded`/`SearchResults` message so the
-/// reducer can surface them; player errors become [`Message::Error`].
-async fn run_action(
-    api: Arc<dyn SpotifyApi>,
-    player: Arc<dyn Playback>,
-    action: Action,
-) -> Option<Message> {
+/// API errors are wrapped into the corresponding `*Loaded`/`SearchResults`
+/// message so the reducer can surface them. Player control and inline actions
+/// never reach here (see `dispatch_action`).
+async fn run_action(api: Arc<dyn SpotifyApi>, action: Action) -> Option<Message> {
     match action {
         Action::Search { query, limit } => Some(Message::SearchResults(
             search(api.as_ref(), &query, limit).await,
@@ -603,19 +653,23 @@ async fn run_action(
                 result,
             })
         }
-        Action::PlayerLoad { queue, index } => {
-            player_result(player.load_queue(&queue, index, true))
+        Action::ToggleSaved(id) => {
+            Some(Message::SavedToggled(toggle_saved(api.as_ref(), &id).await))
         }
-        Action::PlayerPlay => player_result(player.play()),
-        Action::PlayerPause => player_result(player.pause()),
-        Action::PlayerNext => player_result(player.next()),
-        Action::PlayerPreloadNext { current } => player_result(player.preload_next(&current)),
-        Action::PlayerPrev => player_result(player.previous()),
-        Action::PlayerSeek(position_ms) => player_result(player.seek(position_ms)),
-        Action::PlayerSetVolume(volume) => player_result(player.set_volume(volume)),
-        // Handled inline in `dispatch_action` (IPC publish, art loading, and the
-        // session reconnect); the background token refresh runs as its own task.
-        Action::PublishNowPlaying(_) | Action::LoadAlbumArt(_) | Action::PlayerReconnect => None,
+        // Handled inline in `dispatch_action`: player control (kept in emit
+        // order), IPC publish, art loading, and the session reconnect.
+        Action::PlayerLoad { .. }
+        | Action::PlayerSetQueue { .. }
+        | Action::PlayerPlay
+        | Action::PlayerPause
+        | Action::PlayerPlayIndex(_)
+        | Action::PlayerStop
+        | Action::PlayerPreload(_)
+        | Action::PlayerSeek(_)
+        | Action::PlayerSetVolume(_)
+        | Action::PublishNowPlaying(_)
+        | Action::LoadAlbumArt(_)
+        | Action::PlayerReconnect => None,
     }
 }
 
@@ -703,11 +757,17 @@ async fn reconnect_session(player: Arc<dyn Playback>, creds: Credentials) -> Opt
     }
 }
 
-/// Turn a player control result into an error message, or nothing on success.
-fn player_result(result: Result<(), crate::error::PlayerError>) -> Option<Message> {
-    match result {
-        Ok(()) => None,
-        Err(err) => Some(Message::Error(err.to_string())),
+/// Flip `id`'s presence in Liked Songs, returning whether it is now saved.
+async fn toggle_saved(
+    api: &dyn SpotifyApi,
+    id: &crate::model::TrackId,
+) -> Result<bool, crate::error::ApiError> {
+    if api.is_track_saved(id).await? {
+        api.remove_saved_track(id).await?;
+        Ok(false)
+    } else {
+        api.save_track(id).await?;
+        Ok(true)
     }
 }
 

@@ -1,9 +1,11 @@
 //! Streaming boundary: the [`Playback`] trait and its implementations.
 //!
 //! The trait decouples the TUI from librespot so playback can be driven by a
-//! mock in tests. `next`/`previous` are an app-side queue cursor that calls
-//! [`Playback::load`] — librespot's bare `Player` has no built-in queue
-//! (librespot-connect/Spirc is intentionally not a dependency).
+//! mock in tests. The reducer owns queue order and every advance decision
+//! (next/previous/repeat/shuffle); the player mirrors the queue only so
+//! [`Playback::play_at`] and reconnect-resume can address tracks by index —
+//! librespot's bare `Player` has no built-in queue (librespot-connect/Spirc is
+//! intentionally not a dependency).
 
 use crate::error::PlayerError;
 use crate::model::TrackId;
@@ -101,30 +103,45 @@ pub trait Playback: Send + Sync {
     /// Returns [`PlayerError`] if no track is loaded.
     fn pause(&self) -> Result<(), PlayerError>;
 
-    /// Advance the app-side queue cursor and load the next track.
+    /// Replace the mirrored queue and cursor without touching playback.
+    ///
+    /// The reducer owns queue order (shuffle, repeat, add/remove); this keeps
+    /// the player's copy — used by [`Playback::play_at`] and reconnect resume —
+    /// in sync after a reorder.
     ///
     /// # Errors
     ///
-    /// Returns [`PlayerError`] if the queue is empty or the load fails.
-    fn next(&self) -> Result<(), PlayerError>;
+    /// Returns [`PlayerError`] if no session is connected.
+    fn set_queue(&self, tracks: &[TrackId], cursor: Option<usize>) -> Result<(), PlayerError>;
 
-    /// Preload the next app-side queue item after `current`, if one exists.
+    /// Load and play the queue entry at `index`.
     ///
-    /// This is a best-effort latency hint from the streaming engine. A stale
-    /// hint, missing cursor, or end-of-queue condition is a no-op.
+    /// The reducer decides every advance (next/previous/repeat/jump) and names
+    /// the target index explicitly; the player no longer walks the queue.
     ///
     /// # Errors
     ///
-    /// Returns [`PlayerError`] if the player state lock is poisoned or the next
-    /// track id cannot be converted into a playable URI.
-    fn preload_next(&self, current: &TrackId) -> Result<(), PlayerError>;
+    /// Returns [`PlayerError`] if no session is connected or `index` is out of
+    /// range.
+    fn play_at(&self, index: usize) -> Result<(), PlayerError>;
 
-    /// Rewind the app-side queue cursor and load the previous track.
+    /// Stop playback (end of queue with repeat off).
     ///
     /// # Errors
     ///
-    /// Returns [`PlayerError`] if the queue is empty or the load fails.
-    fn previous(&self) -> Result<(), PlayerError>;
+    /// Returns [`PlayerError`] if no session is connected.
+    fn stop(&self) -> Result<(), PlayerError>;
+
+    /// Preload `track` so the upcoming advance starts gaplessly.
+    ///
+    /// Best-effort latency hint; the reducer picks the track (respecting
+    /// shuffle/repeat order).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError`] if the state lock is poisoned or the id cannot
+    /// be converted into a playable URI.
+    fn preload(&self, track: &TrackId) -> Result<(), PlayerError>;
 
     /// Seek the current track to `position_ms`.
     ///

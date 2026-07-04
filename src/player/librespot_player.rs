@@ -48,16 +48,6 @@ struct Connected {
     cursor: Option<usize>,
 }
 
-/// Resumable session state captured before a reconnect rebuilds the session.
-struct SessionSnapshot {
-    /// The play queue to restore.
-    queue: Vec<TrackId>,
-    /// The cursor (currently loaded track) to resume, if any.
-    cursor: Option<usize>,
-    /// The mixer volume (librespot raw scale) to carry over, if connected.
-    volume: Option<u16>,
-}
-
 /// librespot-backed playback engine.
 pub struct LibrespotPlayer {
     /// Sender the event bridge pushes normalized [`PlaybackEvent`]s onto.
@@ -127,25 +117,14 @@ impl LibrespotPlayer {
         Ok((session, player, mixer))
     }
 
-    /// Snapshot the queue, cursor, and current volume, releasing the lock before
-    /// any `.await` (clippy `await_holding_lock` is denied).
-    fn snapshot_state(&self) -> Result<SessionSnapshot, PlayerError> {
+    /// Read the current mixer volume, releasing the lock before any `.await`
+    /// (clippy `await_holding_lock` is denied).
+    fn current_volume(&self) -> Result<Option<u16>, PlayerError> {
         let guard = self
             .connected
             .lock()
             .map_err(|_| PlayerError::Session("reconnect: player lock poisoned".to_owned()))?;
-        Ok(match guard.as_ref() {
-            Some(connected) => SessionSnapshot {
-                queue: connected.queue.clone(),
-                cursor: connected.cursor,
-                volume: Some(connected.mixer.volume()),
-            },
-            None => SessionSnapshot {
-                queue: Vec::new(),
-                cursor: None,
-                volume: None,
-            },
-        })
+        Ok(guard.as_ref().map(|connected| connected.mixer.volume()))
     }
 
     /// Borrow the connected runtime or return a descriptive "not connected" error.
@@ -206,29 +185,34 @@ impl Playback for LibrespotPlayer {
     }
 
     async fn reconnect(&self, creds: Credentials) -> Result<(), PlayerError> {
-        // Carry the queue/cursor/volume across the rebuild so playback resumes
-        // where it left off. The lock is released before the handshake await.
-        let snapshot = self.snapshot_state()?;
-        let (session, player, mixer) = Box::pin(self.establish(creds, snapshot.volume)).await?;
-        let mut connected = Connected {
-            _session: session,
-            player,
-            mixer,
-            queue: snapshot.queue,
-            cursor: None,
-        };
-        // Install the new session first so it is the active generation, then
-        // resume best-effort: a failed reload must not orphan the new session
-        // (leaving the old, silenced one installed) or drop a live bridge.
-        if let Some(index) = snapshot.cursor {
-            if let Err(err) = Self::load_at(&mut connected, index, true) {
-                tracing::warn!(error = %err, "reconnect: could not resume current track");
-            }
-        }
+        // Only the volume needs a pre-handshake snapshot (the mixer is rebuilt
+        // from scratch). The queue/cursor are read at install time below, so a
+        // set_queue/stop applied while the handshake was in flight survives the
+        // rebuild instead of being rolled back to a stale snapshot.
+        let volume = self.current_volume()?;
+        let (session, player, mixer) = Box::pin(self.establish(creds, volume)).await?;
         let mut guard = self
             .connected
             .lock()
             .map_err(|_| PlayerError::Session("reconnect: player lock poisoned".to_owned()))?;
+        let (queue, cursor) = match guard.as_ref() {
+            Some(old) => (old.queue.clone(), old.cursor),
+            None => (Vec::new(), None),
+        };
+        let mut connected = Connected {
+            _session: session,
+            player,
+            mixer,
+            queue,
+            cursor: None,
+        };
+        // Resume best-effort: a failed reload must not orphan the new session
+        // (leaving the old, silenced one installed) or drop a live bridge.
+        if let Some(index) = cursor {
+            if let Err(err) = Self::load_at(&mut connected, index, true) {
+                tracing::warn!(error = %err, "reconnect: could not resume current track");
+            }
+        }
         *guard = Some(connected);
         Ok(())
     }
@@ -265,45 +249,31 @@ impl Playback for LibrespotPlayer {
         })
     }
 
-    fn next(&self) -> Result<(), PlayerError> {
-        self.with_connected("next", |connected| {
-            if let Some(index) = next_index(connected.cursor, connected.queue.len()) {
-                Self::load_at(connected, index, true)
-            } else {
-                // End of the queue: stop rather than erroring.
-                connected.player.stop();
-                connected.cursor = None;
-                Ok(())
-            }
+    fn set_queue(&self, tracks: &[TrackId], cursor: Option<usize>) -> Result<(), PlayerError> {
+        self.with_connected("set_queue", |connected| {
+            connected.queue = tracks.to_vec();
+            connected.cursor = cursor;
+            Ok(())
         })
     }
 
-    fn preload_next(&self, current: &TrackId) -> Result<(), PlayerError> {
-        let mut guard = self
-            .connected
-            .lock()
-            .map_err(|_| PlayerError::Control("preload_next: player lock poisoned".to_owned()))?;
-        let Some(connected) = guard.as_mut() else {
-            return Ok(());
-        };
-        let uri = {
-            let Some(track) = next_track_to_preload(&connected.queue, connected.cursor, current)
-            else {
-                return Ok(());
-            };
-            track_uri(track)?
-        };
-        connected.player.preload(uri);
-        Ok(())
+    fn play_at(&self, index: usize) -> Result<(), PlayerError> {
+        self.with_connected("play_at", |connected| Self::load_at(connected, index, true))
     }
 
-    fn previous(&self) -> Result<(), PlayerError> {
-        self.with_connected("previous", |connected| {
-            // Already at the first track: no-op rather than erroring.
-            let Some(index) = previous_index(connected.cursor) else {
-                return Ok(());
-            };
-            Self::load_at(connected, index, true)
+    fn stop(&self) -> Result<(), PlayerError> {
+        self.with_connected("stop", |connected| {
+            connected.player.stop();
+            connected.cursor = None;
+            Ok(())
+        })
+    }
+
+    fn preload(&self, track: &TrackId) -> Result<(), PlayerError> {
+        let uri = track_uri(track)?;
+        self.with_connected("preload", |connected| {
+            connected.player.preload(uri);
+            Ok(())
         })
     }
 
@@ -472,45 +442,12 @@ fn mixer_to_percent(raw: u16) -> u16 {
     u16::try_from(scaled).unwrap_or(PERCENT_MAX)
 }
 
-/// Compute the index of the next queue entry, or `None` at the end / when empty.
-fn next_index(cursor: Option<usize>, len: usize) -> Option<usize> {
-    let next = match cursor {
-        Some(current) => current + 1,
-        None => 0,
-    };
-    (next < len).then_some(next)
-}
-
-/// Return the queue item to preload for a current-track hint.
-fn next_track_to_preload<'a>(
-    queue: &'a [TrackId],
-    cursor: Option<usize>,
-    current: &TrackId,
-) -> Option<&'a TrackId> {
-    let cursor = cursor?;
-    let loaded = queue.get(cursor)?;
-    if loaded != current {
-        return None;
-    }
-    let index = next_index(Some(cursor), queue.len())?;
-    queue.get(index)
-}
-
-/// Compute the index of the previous queue entry, or `None` at the start.
-fn previous_index(cursor: Option<usize>) -> Option<usize> {
-    match cursor {
-        Some(current) if current > 0 => Some(current - 1),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::model::TrackId;
     use crate::player::PlaybackEvent;
     use crate::player::librespot_player::{
-        map_player_event, mixer_to_percent, next_index, next_track_to_preload, percent_to_mixer,
-        previous_index, track_uri, uri_to_track_id,
+        map_player_event, mixer_to_percent, percent_to_mixer, track_uri, uri_to_track_id,
     };
     use librespot_core::spotify_id::SpotifyId;
     use librespot_core::spotify_uri::SpotifyUri;
@@ -545,53 +482,6 @@ mod tests {
             let back = mixer_to_percent(percent_to_mixer(percent));
             assert!(back.abs_diff(percent) <= 1, "percent {percent} -> {back}");
         }
-    }
-
-    #[test]
-    fn next_index_walks_then_stops_at_end() {
-        assert_eq!(next_index(None, 3), Some(0));
-        assert_eq!(next_index(Some(0), 3), Some(1));
-        assert_eq!(next_index(Some(2), 3), None);
-    }
-
-    #[test]
-    fn next_index_empty_queue_is_none() {
-        assert_eq!(next_index(None, 0), None);
-    }
-
-    #[test]
-    fn next_track_to_preload_requires_matching_cursor() {
-        let queue = vec![
-            TrackId("track-a".to_owned()),
-            TrackId("track-b".to_owned()),
-            TrackId("track-c".to_owned()),
-        ];
-
-        assert_eq!(
-            next_track_to_preload(&queue, Some(0), &TrackId("track-a".to_owned())),
-            Some(&TrackId("track-b".to_owned()))
-        );
-        assert_eq!(
-            next_track_to_preload(&queue, Some(0), &TrackId("track-c".to_owned())),
-            None
-        );
-    }
-
-    #[test]
-    fn next_track_to_preload_stops_at_queue_end() {
-        let queue = vec![TrackId("track-a".to_owned())];
-
-        assert_eq!(
-            next_track_to_preload(&queue, Some(0), &TrackId("track-a".to_owned())),
-            None
-        );
-    }
-
-    #[test]
-    fn previous_index_walks_then_stops_at_start() {
-        assert_eq!(previous_index(Some(2)), Some(1));
-        assert_eq!(previous_index(Some(0)), None);
-        assert_eq!(previous_index(None), None);
     }
 
     #[test]

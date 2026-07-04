@@ -69,6 +69,18 @@ pub enum Message {
     NextTrack,
     /// Skip to the previous queued track.
     PrevTrack,
+    /// Toggle shuffle on the play queue.
+    ToggleShuffle,
+    /// Cycle the repeat mode (off → all → one).
+    CycleRepeat,
+    /// Save/unsave the now-playing track to Liked Songs.
+    ToggleLike,
+    /// The like/unlike round trip finished; `Ok(true)` means now saved.
+    SavedToggled(Result<bool, ApiError>),
+    /// Append the selected track to the play queue.
+    QueueSelected,
+    /// Remove the selected row from the play queue (Queue screen).
+    RemoveQueued,
     /// Seek by a relative number of milliseconds (may be negative).
     SeekRelative(i32),
     /// Change the app (librespot) volume by a relative percentage.
@@ -100,18 +112,26 @@ pub enum Action {
     LoadAlbumTracks(AlbumId),
     /// Load a list of tracks as the play queue, starting at `index`.
     PlayerLoad { queue: Vec<TrackId>, index: usize },
+    /// Replace the player's mirrored queue/cursor without touching playback
+    /// (after a reducer-side reorder: shuffle, add, remove).
+    PlayerSetQueue {
+        queue: Vec<TrackId>,
+        cursor: Option<usize>,
+    },
     /// Resume playback.
     PlayerPlay,
     /// Pause playback.
     PlayerPause,
-    /// Advance to the next queued track.
-    PlayerNext,
-    /// Preload the next queued track while `current` is still playing.
-    PlayerPreloadNext { current: TrackId },
-    /// Go back to the previous queued track.
-    PlayerPrev,
+    /// Load and play the queue entry at this index (reducer-chosen advance).
+    PlayerPlayIndex(usize),
+    /// Stop playback (end of queue, repeat off).
+    PlayerStop,
+    /// Preload this track for a gapless upcoming advance.
+    PlayerPreload(TrackId),
     /// Rebuild the dropped streaming session and resume the current track.
     PlayerReconnect,
+    /// Toggle this track's presence in Liked Songs, replying `SavedToggled`.
+    ToggleSaved(TrackId),
     /// Seek to an absolute position.
     PlayerSeek(u32),
     /// Set absolute app (librespot) volume (0..=100).

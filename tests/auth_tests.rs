@@ -44,15 +44,19 @@ fn scopes_cover_the_used_read_endpoints() {
 }
 
 #[test]
-fn scopes_are_minimal_and_read_only() {
-    // Privacy guard: the Web API token must never request write, playback-control,
-    // profile, streaming, or deprecated-endpoint scopes — only the read scopes the
-    // features use. Adding a broader scope here is a deliberate decision that must
+fn scopes_are_minimal() {
+    // Privacy guard: the Web API token requests only the scopes the features
+    // use. The single write scope is user-library-modify (the like/unlike key);
+    // playback-control, profile, streaming, and deprecated-endpoint scopes must
+    // never appear. Adding a scope here is a deliberate decision that must
     // update this test.
     let scopes = scopes();
-    assert_eq!(scopes.len(), 4, "unexpected scope added: {scopes:?}");
+    assert_eq!(scopes.len(), 5, "unexpected scope added: {scopes:?}");
     for scope in &scopes {
-        assert!(!scope.contains("modify"), "no write scope allowed: {scope}");
+        assert!(
+            !scope.contains("modify") || *scope == "user-library-modify",
+            "unexpected write scope: {scope}"
+        );
     }
     assert!(!scopes.contains(&"streaming"));
     assert!(!scopes.contains(&"user-read-private"));

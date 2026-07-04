@@ -8,7 +8,7 @@
 
 use crate::error::ApiError;
 use crate::model::{
-    AlbumId, AlbumItem, ArtistItem, PlaylistId, PlaylistItem, TimeRange, TrackItem,
+    AlbumId, AlbumItem, ArtistItem, PlaylistId, PlaylistItem, TimeRange, TrackId, TrackItem,
 };
 use async_trait::async_trait;
 use secrecy::SecretString;
@@ -81,6 +81,15 @@ pub trait SpotifyApi: Send + Sync {
 
     /// The tracks of a single album (drilled into from the Albums tab).
     async fn album_tracks(&self, id: &AlbumId) -> Result<Vec<TrackItem>, ApiError>;
+
+    /// Whether `id` is in the user's Liked Songs (`/me/tracks/contains`).
+    async fn is_track_saved(&self, id: &TrackId) -> Result<bool, ApiError>;
+
+    /// Save `id` to the user's Liked Songs (needs `user-library-modify`).
+    async fn save_track(&self, id: &TrackId) -> Result<(), ApiError>;
+
+    /// Remove `id` from the user's Liked Songs (needs `user-library-modify`).
+    async fn remove_saved_track(&self, id: &TrackId) -> Result<(), ApiError>;
 
     /// Replace the bearer access token used for subsequent requests.
     ///

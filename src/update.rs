@@ -6,7 +6,9 @@
 
 use crate::message::{Action, Message};
 use crate::model::{PlaybackSnapshot, PlaybackState, TimeRange, TrackId, TrackListSource};
-use crate::state::{LibraryTab, LoadPhase, Mode, Model, PlaybackHealth, Screen, SearchTab};
+use crate::state::{
+    LibraryTab, LoadPhase, Mode, Model, PlaybackHealth, RepeatMode, Screen, SearchTab,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::time::{Duration, Instant};
 
@@ -63,8 +65,14 @@ pub fn update(model: &mut Model, msg: Message) -> Vec<Action> {
         Message::TopArtistsLoaded(result) => top_artists_loaded(model, result),
         Message::PlaybackEvent(event) => playback_event(model, event),
         Message::TogglePlayPause => toggle_play_pause(model),
-        Message::NextTrack => next_track(model),
+        Message::NextTrack => advance_track(model, true),
         Message::PrevTrack => previous_track(model),
+        Message::ToggleShuffle => toggle_shuffle(model),
+        Message::CycleRepeat => cycle_repeat(model),
+        Message::ToggleLike => toggle_like(model),
+        Message::SavedToggled(result) => saved_toggled(model, result),
+        Message::QueueSelected => queue_selected(model),
+        Message::RemoveQueued => remove_queued(model),
         Message::SeekRelative(delta) => seek_relative(model, delta),
         Message::VolumeDelta(delta) => volume_delta(model, delta),
         // Window resize is handled by the next draw, not the Model.
@@ -348,7 +356,7 @@ fn tab_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
             model.reset_selection();
             Some(Vec::new())
         }
-        Screen::Playlists | Screen::Tracks => None,
+        Screen::Playlists | Screen::Tracks | Screen::Queue => None,
     }
 }
 
@@ -365,6 +373,7 @@ fn global_key(model: &mut Model, code: KeyCode) -> Option<Vec<Action>> {
         KeyCode::Char('1') => Some(enter_screen(model, Screen::Search)),
         KeyCode::Char('2') => Some(enter_screen(model, Screen::Playlists)),
         KeyCode::Char('3') => Some(enter_screen(model, Screen::Library)),
+        KeyCode::Char('4') => Some(enter_screen(model, Screen::Queue)),
         // Force-reload the active view, bypassing the freshness cache. Yields
         // to a user binding so a configured `r` keeps its configured meaning
         // (the help hints stop advertising `r` in that case too).
@@ -408,13 +417,16 @@ fn select_page(model: &mut Model, forward: bool) -> Vec<Action> {
     Vec::new()
 }
 
-/// Playback transport keys (play/pause, skip, seek).
+/// Playback transport and queue keys (play/pause, skip, seek, shuffle, like).
+///
+/// The hardcoded feature keys (`s`/`R`/`f`/`a`/`x`) each yield to a user
+/// binding that claims the same character.
 fn transport_key(model: &mut Model, code: KeyCode) -> Vec<Action> {
     if char_key(code, model.keybindings.play_pause) {
         return toggle_play_pause(model);
     }
     if char_key(code, model.keybindings.next) {
-        return next_track(model);
+        return advance_track(model, true);
     }
     if char_key(code, model.keybindings.previous) {
         return previous_track(model);
@@ -424,6 +436,11 @@ fn transport_key(model: &mut Model, code: KeyCode) -> Vec<Action> {
         KeyCode::Left | KeyCode::Char('h') => seek_relative(model, -SEEK_STEP_MS),
         KeyCode::Char('+' | '=') => volume_delta(model, VOLUME_STEP),
         KeyCode::Char('-' | '_') => volume_delta(model, -VOLUME_STEP),
+        KeyCode::Char('s') if !model.keybindings.uses('s') => toggle_shuffle(model),
+        KeyCode::Char('R') if !model.keybindings.uses('R') => cycle_repeat(model),
+        KeyCode::Char('f') if !model.keybindings.uses('f') => toggle_like(model),
+        KeyCode::Char('a') if !model.keybindings.uses('a') => queue_selected(model),
+        KeyCode::Char('x') if !model.keybindings.uses('x') => remove_queued(model),
         _ => Vec::new(),
     }
 }
@@ -466,7 +483,8 @@ fn enter_screen(model: &mut Model, screen: Screen) -> Vec<Action> {
     match screen {
         Screen::Playlists => request_playlists(model, false),
         Screen::Library => library_load_action(model, model.library_tab),
-        Screen::Search | Screen::Tracks => Vec::new(),
+        // Search results, drilled-in tracks, and the queue are already local.
+        Screen::Search | Screen::Tracks | Screen::Queue => Vec::new(),
     }
 }
 
@@ -562,6 +580,8 @@ fn refresh_active(model: &mut Model) -> Vec<Action> {
             model.tracks_phase = LoadPhase::Loading;
             vec![source_load_action(source)]
         }
+        // The queue is local state; there is nothing to refetch.
+        Screen::Queue => Vec::new(),
     }
 }
 
@@ -665,6 +685,8 @@ fn activate_selection(model: &mut Model) -> Vec<Action> {
         Screen::Tracks => activate_track(model, index),
         Screen::Library => activate_library(model, index),
         Screen::Search => activate_search(model, index),
+        // Jump straight to the selected queue entry.
+        Screen::Queue => play_queue_index(model, index),
     }
 }
 
@@ -741,32 +763,63 @@ fn activate_search_album(model: &mut Model, index: usize) -> Vec<Action> {
     drill_into_tracks(model, Screen::Search, TrackListSource::Album(id))
 }
 
-/// Advance playback to the next queue entry, updating the expected track before
-/// the player emits events so stale events from the old track are ignored.
-fn next_track(model: &mut Model) -> Vec<Action> {
-    let mut actions = if expect_next_track(model) {
-        stage_expected_track(model)
-    } else {
-        Vec::new()
+/// Advance playback, staging the expected track before the player emits events
+/// so stale events from the old track are ignored. `manual` distinguishes a
+/// user skip (always advances, even in repeat-one) from a track ending on its
+/// own (repeat-one replays). At the queue end, repeat-all wraps and repeat-off
+/// stops.
+fn advance_track(model: &mut Model, manual: bool) -> Vec<Action> {
+    let len = model.playback_queue.len();
+    let target = match model.playback_queue_cursor {
+        Some(cursor) => next_target(cursor, len, model.repeat, manual),
+        // Stopped with a queue still loaded: a manual next restarts at the top.
+        None if manual && len > 0 => Some(0),
+        None => return Vec::new(),
     };
-    actions.push(Action::PlayerNext);
-    actions
+    let Some(target) = target else {
+        return vec![Action::PlayerStop];
+    };
+    play_queue_index(model, target)
 }
 
-/// Move playback to the previous queue entry, updating the expected track
-/// before the player emits events so stale events from the old track are
-/// ignored.
+/// The queue index a track advance should land on, or `None` to stop.
+fn next_target(cursor: usize, len: usize, repeat: RepeatMode, manual: bool) -> Option<usize> {
+    if !manual && repeat == RepeatMode::One {
+        return Some(cursor);
+    }
+    let next = cursor + 1;
+    if next < len {
+        return Some(next);
+    }
+    (repeat == RepeatMode::All && len > 0).then_some(0)
+}
+
+/// Move playback to the previous queue entry (no wrap at the start).
 fn previous_track(model: &mut Model) -> Vec<Action> {
-    let mut actions = if expect_previous_track(model) {
-        stage_expected_track(model)
-    } else {
-        Vec::new()
+    let Some(cursor) = model.playback_queue_cursor else {
+        return Vec::new();
     };
-    actions.push(Action::PlayerPrev);
+    let Some(previous) = cursor.checked_sub(1) else {
+        return Vec::new();
+    };
+    play_queue_index(model, previous)
+}
+
+/// Stage `index` as the expected track and tell the player to play it.
+fn play_queue_index(model: &mut Model, index: usize) -> Vec<Action> {
+    let Some(track) = model.playback_queue.get(index) else {
+        return Vec::new();
+    };
+    model.playback_queue_cursor = Some(index);
+    model.now_playing_track = Some(track.id.clone());
+    let mut actions = stage_expected_track(model);
+    actions.push(Action::PlayerPlayIndex(index));
     actions
 }
 
 /// Build a player-load action that queues `tracks` and starts at `index`.
+/// With shuffle on, the new queue is shuffled too (the selected track keeps
+/// playing; only the upcoming order is randomized).
 fn play_from(model: &mut Model, tracks: Vec<crate::model::TrackItem>, index: usize) -> Vec<Action> {
     if index >= tracks.len() {
         return Vec::new();
@@ -781,6 +834,10 @@ fn play_from(model: &mut Model, tracks: Vec<crate::model::TrackItem>, index: usi
     };
     model.now_playing_track = Some(selected);
     model.playback_queue_cursor = Some(index);
+    if model.shuffle {
+        shuffle_queue(model);
+    }
+    let index = model.playback_queue_cursor.unwrap_or(index);
     let queue = model
         .playback_queue
         .iter()
@@ -789,6 +846,211 @@ fn play_from(model: &mut Model, tracks: Vec<crate::model::TrackItem>, index: usi
     let mut actions = stage_expected_track(model);
     actions.push(Action::PlayerLoad { queue, index });
     actions
+}
+
+/// Toggle shuffle: randomize the queue order (keeping the current track
+/// playing) or restore the pre-shuffle order, then sync the player's mirror.
+/// Turning shuffle OFF is always allowed, even with an emptied queue, so the
+/// mode can never get stuck on.
+fn toggle_shuffle(model: &mut Model) -> Vec<Action> {
+    if model.shuffle {
+        model.shuffle = false;
+        unshuffle_queue(model);
+        model.set_error("shuffle off");
+    } else {
+        if model.playback_queue.is_empty() {
+            model.set_error("nothing playing to shuffle");
+            return Vec::new();
+        }
+        model.shuffle = true;
+        shuffle_queue(model);
+        model.set_error("shuffle on");
+    }
+    vec![sync_queue_action(model)]
+}
+
+/// Shuffle the queue in place, recording the permutation so unshuffle restores
+/// the exact original order and the cursor follows its exact queue *instance*
+/// (a lookup by track id would land on the wrong copy of a duplicate track).
+///
+/// The one impure spot in the reducer (alongside `Instant::now`): tests assert
+/// permutation invariants, not a specific order.
+fn shuffle_queue(model: &mut Model) {
+    use rand::seq::SliceRandom as _;
+    let mut order: Vec<usize> = (0..model.playback_queue.len()).collect();
+    order.shuffle(&mut rand::rng());
+    let previous = std::mem::take(&mut model.playback_queue);
+    let mut slots: Vec<Option<crate::model::TrackItem>> = previous.into_iter().map(Some).collect();
+    model.playback_queue = order
+        .iter()
+        .filter_map(|&index| slots.get_mut(index).and_then(Option::take))
+        .collect();
+    model.playback_queue_cursor = model
+        .playback_queue_cursor
+        .and_then(|cursor| order.iter().position(|&index| index == cursor));
+    model.shuffle_order = Some(order);
+}
+
+/// Restore the pre-shuffle order recorded by [`shuffle_queue`], moving the
+/// cursor to the same queue instance's original position.
+fn unshuffle_queue(model: &mut Model) {
+    let Some(order) = model.shuffle_order.take() else {
+        return;
+    };
+    if order.len() != model.playback_queue.len() {
+        // Defensive: the permutation desynced from the queue; keep the current
+        // order rather than corrupt it.
+        return;
+    }
+    let cursor_original = model
+        .playback_queue_cursor
+        .and_then(|cursor| order.get(cursor).copied());
+    let shuffled = std::mem::take(&mut model.playback_queue);
+    let mut pairs: Vec<(usize, crate::model::TrackItem)> =
+        order.into_iter().zip(shuffled).collect();
+    pairs.sort_by_key(|(original, _)| *original);
+    model.playback_queue = pairs.into_iter().map(|(_, item)| item).collect();
+    model.playback_queue_cursor = cursor_original;
+}
+
+/// Mirror the reducer's queue/cursor into the player (after a reorder).
+fn sync_queue_action(model: &Model) -> Action {
+    Action::PlayerSetQueue {
+        queue: model
+            .playback_queue
+            .iter()
+            .map(|track| track.id.clone())
+            .collect(),
+        cursor: model.playback_queue_cursor,
+    }
+}
+
+/// Cycle the repeat mode: off → all → one → off.
+fn cycle_repeat(model: &mut Model) -> Vec<Action> {
+    model.repeat = match model.repeat {
+        RepeatMode::Off => RepeatMode::All,
+        RepeatMode::All => RepeatMode::One,
+        RepeatMode::One => RepeatMode::Off,
+    };
+    model.set_error(match model.repeat {
+        RepeatMode::Off => "repeat off",
+        RepeatMode::All => "repeat all",
+        RepeatMode::One => "repeat one",
+    });
+    Vec::new()
+}
+
+/// Save/unsave the now-playing track to Liked Songs.
+///
+/// One toggle at a time: the round trip is a read-then-write pair, so two
+/// concurrent toggles would both read the same state and apply the same
+/// change, ending opposite to what the second press meant.
+fn toggle_like(model: &mut Model) -> Vec<Action> {
+    if model.like_in_flight {
+        model.set_error("still updating Liked Songs…");
+        return Vec::new();
+    }
+    let Some(track) = model.now_playing_track.clone() else {
+        model.set_error("nothing playing to like");
+        return Vec::new();
+    };
+    if track.0.is_empty() {
+        model.set_error("this track has no Spotify id");
+        return Vec::new();
+    }
+    model.like_in_flight = true;
+    model.set_error("updating Liked Songs…");
+    vec![Action::ToggleSaved(track)]
+}
+
+/// Fold the like/unlike round-trip result into the status bar, invalidating
+/// the Saved-tracks cache so the tab reflects the change on next entry.
+fn saved_toggled(model: &mut Model, result: Result<bool, crate::error::ApiError>) -> Vec<Action> {
+    model.like_in_flight = false;
+    match result {
+        Ok(saved) => {
+            model.set_error(if saved {
+                "♥ saved to Liked Songs"
+            } else {
+                "removed from Liked Songs"
+            });
+            if model.track_list_source == Some(TrackListSource::SavedTracks) {
+                model.tracks_phase = LoadPhase::Idle;
+            }
+        }
+        Err(err) => model.set_error(format!(
+            "updating Liked Songs failed: {err} (re-run `spot-defy auth login` if this is a 403)"
+        )),
+    }
+    Vec::new()
+}
+
+/// Append the selected track to the play queue (`a`).
+fn queue_selected(model: &mut Model) -> Vec<Action> {
+    if model.screen == Screen::Queue {
+        return Vec::new();
+    }
+    let Some(index) = model.list_state.selected() else {
+        return Vec::new();
+    };
+    let Some(track) = active_track_list(model).get(index).cloned() else {
+        model.set_error("no track selected to queue");
+        return Vec::new();
+    };
+    if model.playback_queue.is_empty() {
+        model.set_error("nothing playing — press ↵ to play instead");
+        return Vec::new();
+    }
+    model.set_error(format!("queued: {}", track.title));
+    // While shuffled, the appended track's pre-shuffle position is the end of
+    // the original order (== the permutation's length so far).
+    if let Some(order) = model.shuffle_order.as_mut() {
+        order.push(order.len());
+    }
+    model.playback_queue.push(track);
+    vec![sync_queue_action(model)]
+}
+
+/// Remove the selected row from the play queue (`x`, Queue screen only).
+fn remove_queued(model: &mut Model) -> Vec<Action> {
+    if model.screen != Screen::Queue {
+        return Vec::new();
+    }
+    let Some(index) = model.list_state.selected() else {
+        return Vec::new();
+    };
+    if index >= model.playback_queue.len() {
+        return Vec::new();
+    }
+    if model.playback_queue_cursor == Some(index) {
+        model.set_error("can't remove the playing track");
+        return Vec::new();
+    }
+    let removed = model.playback_queue.remove(index);
+    if let Some(cursor) = model.playback_queue_cursor {
+        if index < cursor {
+            model.playback_queue_cursor = Some(cursor - 1);
+        }
+    }
+    // Drop the exact removed instance from the shuffle permutation so the
+    // eventual unshuffle restores the right remaining order (an id lookup
+    // would delete the wrong copy of a duplicate track).
+    if let Some(order) = model.shuffle_order.as_mut() {
+        if index < order.len() {
+            let removed_original = order.remove(index);
+            for slot in order.iter_mut() {
+                if *slot > removed_original {
+                    *slot -= 1;
+                }
+            }
+        }
+    }
+    let len = model.playback_queue.len();
+    model
+        .list_state
+        .select((len > 0).then_some(index.min(len - 1)));
+    model.set_error(format!("removed: {}", removed.title));
+    vec![sync_queue_action(model)]
 }
 
 /// Toggle between play and pause based on the current playback state.
@@ -886,13 +1148,15 @@ fn playback_event(model: &mut Model, event: crate::player::PlaybackEvent) -> Vec
         }
         Ev::PreloadNext { track } => {
             if is_current_track(model, &track) {
-                return vec![Action::PlayerPreloadNext { current: track }];
+                if let Some(next) = peek_next_preload(model) {
+                    return vec![Action::PlayerPreload(next)];
+                }
             }
             return Vec::new();
         }
         Ev::EndOfTrack { track } => {
             if is_current_track(model, &track) {
-                return next_track(model);
+                return advance_track(model, false);
             }
             return Vec::new();
         }
@@ -928,12 +1192,20 @@ fn apply_stopped(model: &mut Model) {
 /// session is dead (a broken pipe drops the audio-key channel, so every track
 /// fails), so reconnect once instead of skipping through the entire queue.
 fn track_unavailable(model: &mut Model) -> Vec<Action> {
+    // Repeat-all around a short queue can wrap the "skip" back onto the very
+    // track that just failed; replaying it (and escalating the failure streak
+    // into a session reconnect) helps nobody — stop instead.
+    if skip_would_replay_failed_track(model) {
+        model.playback_health = PlaybackHealth::Healthy;
+        model.now_playing.state = PlaybackState::Stopped;
+        model.set_error("track unavailable here — stopped".to_owned());
+        return vec![Action::PlayerStop];
+    }
     match model.playback_health {
         PlaybackHealth::Healthy => {
             model.playback_health = PlaybackHealth::Skipping(1);
             model.set_error("track unavailable here — skipping".to_owned());
-            let _ = expect_next_track(model);
-            vec![Action::PlayerNext]
+            advance_track(model, true)
         }
         PlaybackHealth::Skipping(count) => {
             let count = count + 1;
@@ -944,8 +1216,7 @@ fn track_unavailable(model: &mut Model) -> Vec<Action> {
             } else {
                 model.playback_health = PlaybackHealth::Skipping(count);
                 model.set_error("track unavailable here — skipping".to_owned());
-                let _ = expect_next_track(model);
-                vec![Action::PlayerNext]
+                advance_track(model, true)
             }
         }
         // After a reconnect, a few more failures means the tracks themselves are
@@ -960,11 +1231,19 @@ fn track_unavailable(model: &mut Model) -> Vec<Action> {
                 Vec::new()
             } else {
                 model.playback_health = PlaybackHealth::Reconnecting(count);
-                let _ = expect_next_track(model);
-                vec![Action::PlayerNext]
+                advance_track(model, true)
             }
         }
     }
+}
+
+/// Whether skipping the failed track would land right back on it (repeat-all
+/// wrapping a single-entry queue).
+fn skip_would_replay_failed_track(model: &Model) -> bool {
+    let Some(cursor) = model.playback_queue_cursor else {
+        return false;
+    };
+    next_target(cursor, model.playback_queue.len(), model.repeat, true) == Some(cursor)
 }
 
 /// React to the streaming session dropping: reconnect once, marking stopped.
@@ -1002,12 +1281,21 @@ fn sync_track_if_needed(model: &mut Model, track: &TrackId) -> bool {
 fn sync_now_playing_track(model: &mut Model, track: &TrackId) {
     model.now_playing_track = Some(track.clone());
     model.now_playing_metadata_track = Some(track.clone());
-    if let Some(index) = model
-        .playback_queue
-        .iter()
-        .position(|item| &item.id == track)
-    {
-        model.playback_queue_cursor = Some(index);
+    // Keep a cursor that already points at this track id: it identifies the
+    // exact queue instance (set by an explicit jump or advance), and a
+    // first-match id lookup would snap it to the wrong copy of a duplicate.
+    let cursor_matches = model
+        .playback_queue_cursor
+        .and_then(|cursor| model.playback_queue.get(cursor))
+        .is_some_and(|item| &item.id == track);
+    if !cursor_matches {
+        if let Some(index) = model
+            .playback_queue
+            .iter()
+            .position(|item| &item.id == track)
+        {
+            model.playback_queue_cursor = Some(index);
+        }
     }
     follow_now_playing(model, track);
     let Some((title, artist, duration_ms)) = find_playback_track(model, track)
@@ -1055,32 +1343,18 @@ fn accept_track_event(model: &Model, track: &TrackId) -> bool {
         .is_none_or(|expected| expected == track)
 }
 
-fn expect_next_track(model: &mut Model) -> bool {
-    let Some(cursor) = model.playback_queue_cursor else {
-        return false;
-    };
-    let next = cursor + 1;
-    let Some(track) = model.playback_queue.get(next) else {
-        return false;
-    };
-    model.playback_queue_cursor = Some(next);
-    model.now_playing_track = Some(track.id.clone());
-    true
-}
-
-fn expect_previous_track(model: &mut Model) -> bool {
-    let Some(cursor) = model.playback_queue_cursor else {
-        return false;
-    };
-    let Some(previous) = cursor.checked_sub(1) else {
-        return false;
-    };
-    let Some(track) = model.playback_queue.get(previous) else {
-        return false;
-    };
-    model.playback_queue_cursor = Some(previous);
-    model.now_playing_track = Some(track.id.clone());
-    true
+/// The track to preload for a gapless auto-advance, respecting repeat order.
+/// `None` when there is nothing new to preload (queue end, repeat-one).
+fn peek_next_preload(model: &Model) -> Option<TrackId> {
+    let cursor = model.playback_queue_cursor?;
+    let target = next_target(cursor, model.playback_queue.len(), model.repeat, false)?;
+    if target == cursor {
+        return None;
+    }
+    model
+        .playback_queue
+        .get(target)
+        .map(|track| track.id.clone())
 }
 
 /// Move the list selection to follow the now-playing `track` when it appears in
@@ -1118,6 +1392,7 @@ fn find_playback_track<'a>(
 fn active_track_list(model: &Model) -> &[crate::model::TrackItem] {
     match model.screen {
         Screen::Tracks => &model.tracks,
+        Screen::Queue => &model.playback_queue,
         Screen::Library
             if matches!(
                 model.library_tab,
@@ -1257,18 +1532,34 @@ mod tests {
 
         model.should_quit = false;
         model.now_playing.state = PlaybackState::Playing;
+        // A two-track queue so the configured next/previous keys can advance.
+        model.playback_queue = vec![
+            crate::model::TrackItem {
+                id: crate::model::TrackId("t1".to_owned()),
+                title: "A".to_owned(),
+                artist: "Artist".to_owned(),
+                album: "Album".to_owned(),
+                duration_ms: 1_000,
+                album_art_images: Vec::new(),
+            },
+            crate::model::TrackItem {
+                id: crate::model::TrackId("t2".to_owned()),
+                title: "B".to_owned(),
+                artist: "Artist".to_owned(),
+                album: "Album".to_owned(),
+                duration_ms: 1_000,
+                album_art_images: Vec::new(),
+            },
+        ];
+        model.playback_queue_cursor = Some(0);
         assert_eq!(
             update(&mut model, key(KeyCode::Char('b'))),
             vec![Action::PlayerPause]
         );
-        assert_eq!(
-            update(&mut model, key(KeyCode::Char('l'))),
-            vec![Action::PlayerNext]
-        );
-        assert_eq!(
-            update(&mut model, key(KeyCode::Char('h'))),
-            vec![Action::PlayerPrev]
-        );
+        let next = update(&mut model, key(KeyCode::Char('l')));
+        assert!(matches!(next.last(), Some(Action::PlayerPlayIndex(1))));
+        let previous = update(&mut model, key(KeyCode::Char('h')));
+        assert!(matches!(previous.last(), Some(Action::PlayerPlayIndex(0))));
         update(&mut model, key(KeyCode::Char('f')));
         assert_eq!(model.screen, Screen::Search);
         assert_eq!(model.mode, Mode::Insert);

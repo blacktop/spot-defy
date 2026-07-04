@@ -9,7 +9,7 @@
 
 use crate::config::{SPOTIFY_BLACK, ThemeColors};
 use crate::model::{AlbumItem, ArtistItem, PlaybackState, PlaylistItem, TrackItem};
-use crate::state::{LibraryTab, LoadPhase, Mode, Model, Screen, SearchTab};
+use crate::state::{LibraryTab, LoadPhase, Mode, Model, RepeatMode, Screen, SearchTab};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Style, Stylize as _};
@@ -101,6 +101,7 @@ pub fn view(
         Screen::Playlists => render_playlists(model, frame, main),
         Screen::Tracks => render_tracks(model, frame, main),
         Screen::Library => render_library(model, frame, main),
+        Screen::Queue => render_queue(model, frame, main),
     }
     if let Some(sidebar) = sidebar {
         render_sidebar(model, art, art_area, font_size, frame, sidebar);
@@ -210,6 +211,7 @@ fn render_header(model: &Model, frame: &mut Frame, area: Rect) {
         (Screen::Search, "1 Search"),
         (Screen::Playlists, "2 Playlists"),
         (Screen::Library, "3 Library"),
+        (Screen::Queue, "4 Queue"),
     ] {
         let span = Span::from(format!(" {label} "));
         spans.push(if screen == active_tab(model) {
@@ -233,9 +235,9 @@ fn active_tab(model: &Model) -> Screen {
         Screen::Tracks => match model.tracks_origin {
             Screen::Search => Screen::Search,
             Screen::Library => Screen::Library,
-            Screen::Playlists | Screen::Tracks => Screen::Playlists,
+            Screen::Playlists | Screen::Tracks | Screen::Queue => Screen::Playlists,
         },
-        Screen::Search | Screen::Playlists | Screen::Library => model.screen,
+        Screen::Search | Screen::Playlists | Screen::Library | Screen::Queue => model.screen,
     }
 }
 
@@ -447,6 +449,45 @@ fn render_library(model: &mut Model, frame: &mut Frame, area: Rect) {
     }
 }
 
+/// Render the live play queue, marking the now-playing row.
+fn render_queue(model: &mut Model, frame: &mut Frame, area: Rect) {
+    let cursor = model.playback_queue_cursor;
+    let theme = model.theme;
+    let items: Vec<ListItem<'static>> = model
+        .playback_queue
+        .iter()
+        .enumerate()
+        .map(|(index, track)| {
+            if Some(index) == cursor {
+                now_playing_row(track, theme)
+            } else {
+                track_row(track, theme)
+            }
+        })
+        .collect();
+    render_list(
+        model,
+        frame,
+        area,
+        "Queue",
+        items,
+        "Queue is empty — play a track (↵) or add one (a).",
+    );
+}
+
+/// Format the queue row for the currently playing track: `♪` marker, accented.
+fn now_playing_row(track: &TrackItem, theme: ThemeColors) -> ListItem<'static> {
+    let line = Line::from(vec![
+        Span::from("♪ ").fg(theme.progress),
+        Span::from(track.artist.clone()).fg(theme.accent).bold(),
+        Span::from("  —  ").style(dim_style(theme)),
+        Span::from(track.title.clone()).bold(),
+        Span::from("   "),
+        Span::from(fmt_ms(track.duration_ms)).fg(theme.progress),
+    ]);
+    ListItem::new(line)
+}
+
 /// Render a one-line sub-tab bar with the active tab highlighted.
 fn render_subtab_bar(
     frame: &mut Frame,
@@ -600,7 +641,12 @@ fn render_footer(model: &Model, frame: &mut Frame, area: Rect) {
     let track = np.track.as_deref().unwrap_or("—");
     let artist = np.artist.as_deref().unwrap_or("—");
     let left = format!("{symbol} {artist} — {track}");
-    let right = format!("{} / {}", fmt_ms(np.position_ms), fmt_ms(np.duration_ms));
+    let modes = mode_indicators(model);
+    let right = format!(
+        "{modes}{} / {}",
+        fmt_ms(np.position_ms),
+        fmt_ms(np.duration_ms)
+    );
     let line = now_playing_line(inner.width as usize, &left, &right);
     frame.render_widget(Paragraph::new(line), inner);
 
@@ -723,6 +769,18 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Shuffle/repeat glyphs for the footer's right segment (empty when both off).
+fn mode_indicators(model: &Model) -> &'static str {
+    match (model.shuffle, model.repeat) {
+        (false, RepeatMode::Off) => "",
+        (false, RepeatMode::All) => "⟳ · ",
+        (false, RepeatMode::One) => "⟳1 · ",
+        (true, RepeatMode::Off) => "⇄ · ",
+        (true, RepeatMode::All) => "⇄ ⟳ · ",
+        (true, RepeatMode::One) => "⇄ ⟳1 · ",
+    }
+}
+
 /// Glyph for a playback state.
 fn state_symbol(state: PlaybackState) -> &'static str {
     match state {
@@ -756,11 +814,18 @@ fn keys_for(model: &Model) -> String {
     let play = key_label(keys.play_pause);
     let skip = format!("{}/{}", key_label(keys.next), key_label(keys.previous));
     let quit = key_label(keys.quit);
-    // Only advertise the hardcoded refresh key while it is actually free.
+    // Only advertise hardcoded keys while they are actually free.
     let refresh = if keys.uses('r') { "" } else { "r refresh · " };
+    let add = if keys.uses('a') { "" } else { "a queue · " };
+    let modes = match (keys.uses('s'), keys.uses('R')) {
+        (false, false) => "s/R modes · ",
+        (false, true) => "s shuffle · ",
+        (true, false) => "R repeat · ",
+        (true, true) => "",
+    };
     match model.screen {
         Screen::Search => format!(
-            "{} edit · Tab lane · ↵ play · {refresh}{} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            "{} edit · Tab lane · ↵ play · {add}{refresh}{} pause · {skip} skip · -/+ vol · {quit} quit",
             key_label(keys.search),
             play,
         ),
@@ -771,11 +836,17 @@ fn keys_for(model: &Model) -> String {
             play,
         ),
         Screen::Tracks => format!(
-            "↵ play · Esc back · {refresh}{play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            "↵ play · Esc back · {add}{refresh}{play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
         ),
         Screen::Library => format!(
-            "Tab tab · ↵ play · {refresh}{play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            "Tab tab · ↵ play · {add}{refresh}{play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
         ),
+        Screen::Queue => {
+            let remove = if keys.uses('x') { "" } else { "x remove · " };
+            format!(
+                "↵ jump · {remove}{modes}{play} pause · {skip} skip · ←/→ seek · -/+ vol · {quit} quit",
+            )
+        }
     }
 }
 

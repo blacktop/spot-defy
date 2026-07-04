@@ -58,16 +58,20 @@ pub fn webapi_client_id_default() -> &'static str {
     WEBAPI_CLIENT_ID
 }
 
-/// The Web API OAuth scopes — the minimal **read-only** set the app's features
-/// actually use: reading your playlists, top items, recently played, and saved
-/// tracks. Search needs no scope. No write/modify scopes, no playback-control
-/// scopes (playback is local via librespot), no profile/email scope, and no
-/// deprecated-endpoint scopes are requested.
+/// The Web API OAuth scopes — the minimal set the app's features actually use:
+/// reading your playlists, top items, recently played, and saved tracks, plus
+/// `user-library-modify` for the like/unlike key. Search needs no scope. No
+/// playback-control scopes (playback is local via librespot), no profile/email
+/// scope, and no deprecated-endpoint scopes are requested.
+///
+/// Refresh tokens minted before a scope was added do not carry it; the like
+/// key will fail with 403 until the user re-runs `spot-defy auth login`.
 #[must_use]
 pub fn scopes() -> Vec<&'static str> {
     vec![
         "playlist-read-private",
         "user-library-read",
+        "user-library-modify",
         "user-top-read",
         "user-read-recently-played",
     ]

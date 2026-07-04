@@ -23,6 +23,20 @@ pub enum Screen {
     Tracks,
     /// Library / top-items discovery.
     Library,
+    /// The live play queue.
+    Queue,
+}
+
+/// Repeat behavior at the end of a track / the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    /// Play through the queue once, then stop.
+    #[default]
+    Off,
+    /// Wrap from the last queue entry back to the first.
+    All,
+    /// Replay the current track when it ends (manual skips still advance).
+    One,
 }
 
 /// Input mode (vim-style): `Normal` for navigation, `Insert` for text entry.
@@ -256,6 +270,19 @@ pub struct Model {
     pub playback_queue: Vec<TrackItem>,
     /// Cursor into `playback_queue` for the track expected to be loaded.
     pub playback_queue_cursor: Option<usize>,
+    /// Whether the queue order is currently shuffled.
+    pub shuffle: bool,
+    /// While shuffled, the permutation that produced the current order:
+    /// `playback_queue[i]` came from pre-shuffle index `shuffle_order[i]`.
+    /// Tracking indices (not track ids) keeps the cursor on the exact queue
+    /// instance even when the same track appears twice, and lets unshuffle
+    /// restore the exact original order after adds/removes.
+    pub shuffle_order: Option<Vec<usize>>,
+    /// Repeat behavior at track/queue end.
+    pub repeat: RepeatMode,
+    /// A like/unlike round trip is in flight; further `f` presses wait for it
+    /// (the toggle is two API calls and must not race itself).
+    pub like_in_flight: bool,
     /// Streaming-session health, tracking consecutive unavailable tracks so a
     /// dead session reconnects instead of skipping the whole queue.
     pub playback_health: PlaybackHealth,
@@ -314,6 +341,7 @@ impl Model {
         match self.screen {
             Screen::Playlists => self.playlists.len(),
             Screen::Tracks => self.tracks.len(),
+            Screen::Queue => self.playback_queue.len(),
             Screen::Library => match self.library_tab {
                 LibraryTab::Albums => self.albums.len(),
                 LibraryTab::TopArtists => self.artists.len(),
