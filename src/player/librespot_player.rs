@@ -324,7 +324,14 @@ fn build_player(session: &Session, mixer: &Arc<dyn Mixer>) -> Result<Arc<Player>
         config,
         session.clone(),
         volume_getter,
-        move || sink_builder(None, AudioFormat::default()),
+        // Force F32, CoreAudio's native sample format. librespot's default is
+        // S16, which makes its exact-open request a format the device rejects
+        // (`StreamConfigNotSupported`) on F32-only outputs — notably the Apple
+        // Studio Display, which exposes only 8-channel F32 configs. That failure
+        // sends librespot into a fallback path that then panics on `.unwrap()`.
+        // Requesting the device's real native format makes the first open
+        // succeed and never reaches the broken fallback.
+        move || sink_builder(None, AudioFormat::F32),
     ))
 }
 
